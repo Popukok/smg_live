@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         看看新闻节目详情修改器
+// @name         收看SMGTV电视节目
 // @namespace    http://tampermonkey.net/
 // @version      0.4
-// @description  拦截节目详情API请求，将is_shield值为1的修改为0
-// @author       You
+// @description  打开网页即可收看SMGTV
+// @author       https://github.com/Popukok
 // @match        https://live.kankanews.com/huikan
 // @grant        none
 // @run-at       document-start
@@ -15,7 +15,6 @@
     // 统一处理节目列表响应数据
     function processProgramsResponse(response) {
         try {
-            // 修改programs数组中所有项的is_shield值为0
             if (response.result && response.result.programs && Array.isArray(response.result.programs)) {
                 response.result.programs.forEach(program => {
                     if (program.is_shield === 1) {
@@ -33,7 +32,6 @@
     // 统一处理节目详情响应数据
     function processProgramDetailResponse(response) {
         try {
-            // 如果is_shield值为1，则修改为0
             if (response.result && response.result.is_shield === 1) {
                 response.result.is_shield = 0;
             }
