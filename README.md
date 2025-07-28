@@ -5,8 +5,8 @@
 |---------------------------------------------------------------------------------------------|
 | [安装](https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.js)  |
 
-安完脚本后[点击打开看看新闻](https://live.kankanews.com/huikan),点击对应的频道即可观看节目。
-例如收看五星体育频道F1比赛直播，可以跳过以下图片提示。
+安完脚本后[点击打开看看新闻](https://live.kankanews.com/huikan),点击对应的频道即可观看节目<br>
+**例如收看五星体育频道F1比赛直播，可以跳过以下图片提示**
 
 ![这是图片](https://p.statickksmg.com/cont/2023/10/08/image_1696731269_qOxBpp34.jpg "")
 
