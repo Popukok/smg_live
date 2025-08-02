@@ -2,11 +2,11 @@
 观看五星体育频道直播而不受限制
 
 # 安装
-需要浏览器装有 [Tampermonkey](https://tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/) 插件, 下方表格中挑一个链接安装.
+需要浏览器装有 [Tampermonkey](https://tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/) 插件, 点击下方表格中安装，即可安装脚本.
 
 |正式版 (GitHub 源)                                                                           |
 |---------------------------------------------------------------------------------------------|
-| [安装](https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.js)  |
+| [安装](httsp://g.geeck.eu.org/https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.js)  |
 
 安完脚本后[点击打开看看新闻](https://live.kankanews.com/huikan)，点击对应的频道即可观看节目<br>
 <br>
