@@ -1,16 +1,16 @@
 // ==UserScript==
-// @name         收看SMGTV电视节目
-// @namespace    http://tampermonkey.net/
-// @version      0.5
-// @description  打开网页即可收看SMGTV
-// @author       https://github.com/Popukok
-// @match        *://*.kankanews.com/huikan
-// @match        *://*.kankanews.com/huikan/
-// @icon        https://skin.kankanews.com/kknews/img/pc_logo@2x.png
-// @updateURL       https://raw.githubusercontent.com/Popukok/smg_live/edit/main/smg_fivestar.user.js
-// @downloadURL     https://raw.githubusercontent.com/Popukok/smg_live/edit/main/smg_fivestar.user.js
-// @grant        none
-// @run-at       document-start
+// @name             收看SMGTV电视节目
+// @namespace        http://tampermonkey.net/
+// @version          0.5
+// @description      打开网页即可收看SMGTV
+// @author           https://github.com/Popukok
+// @match            *://*.kankanews.com/huikan
+// @match            *://*.kankanews.com/huikan/
+// @icon             https://live.kankanews.com/favicon.ico
+// @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/edit/main/smg_fivestar.user.js
+// @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/edit/main/smg_fivestar.user.js
+// @grant            none
+// @run-at           document-start
 // ==/UserScript==
 
 (function() {
