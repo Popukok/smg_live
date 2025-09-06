@@ -6,7 +6,7 @@
 // @author       https://github.com/Popukok
 // @match        *://*.kankanews.com/huikan
 // @match        *://*.kankanews.com/huikan/
-// @@icon        https://skin.kankanews.com/kknews/img/pc_logo@2x.png
+// @icon        https://skin.kankanews.com/kknews/img/pc_logo@2x.png
 // @updateURL       https://raw.githubusercontent.com/Popukok/smg_live/edit/main/smg_fivestar.user.js
 // @downloadURL     https://raw.githubusercontent.com/Popukok/smg_live/edit/main/smg_fivestar.user.js
 // @grant        none
