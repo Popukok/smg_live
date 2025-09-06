@@ -20,8 +20,7 @@
 支持**最新版** Chrome, Firefox, 不保证脚本能在 Safari 和 ["套壳类浏览器"](https://www.jianshu.com/p/67d790a8f221) 中完美运行.
 
 # 移动端
-支持在移动端收看，前提是移动端浏览器支持 **[Tampermonkey](https://tampermonkey.net/)** 插件，
-并且支持运行 **[Tampermonkey](https://tampermonkey.net/)** 脚本
+支持在移动端收看，前提是移动端浏览器支持 **[Tampermonkey](https://tampermonkey.net/)** 插件，<br>并且支持运行 **[Tampermonkey](https://tampermonkey.net/)** 脚本
 
 💎  **如何选择**
 
