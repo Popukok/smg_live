@@ -1,10 +1,14 @@
 // ==UserScript==
 // @name         收看SMGTV电视节目
 // @namespace    http://tampermonkey.net/
-// @version      0.4
+// @version      0.5
 // @description  打开网页即可收看SMGTV
 // @author       https://github.com/Popukok
-// @match        https://live.kankanews.com/huikan
+// @match        *://*.kankanews.com/huikan
+// @match        *://*.kankanews.com/huikan/
+// @@icon        https://skin.kankanews.com/kknews/img/pc_logo@2x.png
+// @updateURL       https://raw.githubusercontent.com/Popukok/smg_live/edit/main/smg_fivestar.user.js
+// @downloadURL     https://raw.githubusercontent.com/Popukok/smg_live/edit/main/smg_fivestar.user.js
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
@@ -12,150 +16,52 @@
 (function() {
     'use strict';
 
-    // 统一处理节目列表响应数据
-    function processProgramsResponse(response) {
-        try {
-            if (response.result && response.result.programs && Array.isArray(response.result.programs)) {
-                response.result.programs.forEach(program => {
-                    if (program.is_shield === 1) {
-                        program.is_shield = 0;
-                    }
-                });
-            }
-            return response;
-        } catch (e) {
-            console.error('处理节目列表数据时出错:', e);
-            return response;
-        }
-    }
+    // 保存原始的XMLHttpRequest.open方法
+    const originalOpen = XMLHttpRequest.prototype.open;
 
-    // 统一处理节目详情响应数据
-    function processProgramDetailResponse(response) {
-        try {
-            if (response.result && response.result.is_shield === 1) {
-                response.result.is_shield = 0;
-            }
-            return response;
-        } catch (e) {
-            console.error('处理节目详情数据时出错:', e);
-            return response;
-        }
-    }
-
-    // 判断是否为目标节目列表URL
-    function isProgramsUrl(url) {
-        return typeof url === 'string' && 
-               url.startsWith('https://kapi.kankanews.com/content/pc/tv/programs?') &&
-               url.includes('channel_id') && 
-               url.includes('date');
-    }
-
-    // 判断是否为目标节目详情URL
-    function isProgramDetailUrl(url) {
-        return typeof url === 'string' && 
-               url.startsWith('https://kapi.kankanews.com/content/pc/tv/program/detail?') &&
-               url.includes('channel_program_id');
-    }
-
-    // 保存原始的XMLHttpRequest对象
-    const xhr = window.XMLHttpRequest;
-    const origOpen = xhr.prototype.open;
-    const origSend = xhr.prototype.send;
-
-    // 拦截XMLHttpRequest请求
-    xhr.prototype.open = function(method, url) {
-        this._url = url;
-        return origOpen.apply(this, arguments);
-    };
-
-    xhr.prototype.send = function() {
-        // 处理节目列表请求
-        if (isProgramsUrl(this._url)) {
-            const origOnReadyStateChange = this.onreadystatechange;
-
-            this.onreadystatechange = function() {
+    // 重写XMLHttpRequest.open方法
+    XMLHttpRequest.prototype.open = function(method, url) {
+        // 检查是否是目标API请求
+        if (url.includes('https://kapi.kankanews.com/content/pc/tv/')) {
+            // 监听readystatechange事件
+            this.addEventListener('readystatechange', function() {
                 if (this.readyState === 4 && this.status === 200) {
                     try {
-                        // 解析响应JSON
-                        let response = JSON.parse(this.responseText);
-                        // 处理响应数据
-                        response = processProgramsResponse(response);
-                        
-                        // 修改响应文本
-                        Object.defineProperty(this, 'responseText', {writable: true});
-                        this.responseText = JSON.stringify(response);
+                        // 解析响应数据
+                        const response = JSON.parse(this.responseText);
+                        let modified = false;
+
+                        // 处理单个节目详情接口
+                        if (url.includes('/program/detail') && response.result && response.result.is_shield === 1) {
+                            response.result.is_shield = 0;
+                            modified = true;
+                        }
+
+                        // 处理节目列表接口
+                        if (url.includes('/programs') && response.result && response.result.programs) {
+                            response.result.programs.forEach(program => {
+                                if (program.is_shield === 1) {
+                                    program.is_shield = 0;
+                                    modified = true;
+                                }
+                            });
+                        }
+
+                        if (modified) {
+                            // 重写responseText属性
+                            Object.defineProperty(this, 'responseText', {
+                                value: JSON.stringify(response),
+                                writable: false
+                            });
+                        }
                     } catch (e) {
-                        console.error('解析节目列表JSON时出错:', e);
+                        console.error('解析JSON响应时出错:', e);
                     }
                 }
-
-                // 调用原始的onreadystatechange
-                if (origOnReadyStateChange) {
-                    origOnReadyStateChange.apply(this, arguments);
-                }
-            };
-        }
-        // 处理节目详情请求
-        else if (isProgramDetailUrl(this._url)) {
-            const origOnReadyStateChange = this.onreadystatechange;
-
-            this.onreadystatechange = function() {
-                if (this.readyState === 4 && this.status === 200) {
-                    try {
-                        // 解析响应JSON
-                        let response = JSON.parse(this.responseText);
-                        // 处理响应数据
-                        response = processProgramDetailResponse(response);
-                        
-                        // 修改响应文本
-                        Object.defineProperty(this, 'responseText', {writable: true});
-                        this.responseText = JSON.stringify(response);
-                    } catch (e) {
-                        console.error('解析节目详情JSON时出错:', e);
-                    }
-                }
-
-                // 调用原始的onreadystatechange
-                if (origOnReadyStateChange) {
-                    origOnReadyStateChange.apply(this, arguments);
-                }
-            };
-        }
-
-        return origSend.apply(this, arguments);
-    };
-
-    // 拦截fetch请求
-    const origFetch = window.fetch;
-    window.fetch = function() {
-        const url = arguments[0];
-        const options = arguments[1];
-
-        // 处理节目列表请求
-        if (isProgramsUrl(url)) {
-            return origFetch.apply(this, arguments).then(response => {
-                const origJson = response.json;
-                response.json = function() {
-                    return origJson.apply(this, arguments).then(data => {
-                        return processProgramsResponse(data);
-                    });
-                };
-                return response;
-            });
-        }
-        // 处理节目详情请求
-        else if (isProgramDetailUrl(url)) {
-            return origFetch.apply(this, arguments).then(response => {
-                const origJson = response.json;
-                response.json = function() {
-                    return origJson.apply(this, arguments).then(data => {
-                        return processProgramDetailResponse(data);
-                    });
-                };
-                return response;
             });
         }
 
-        return origFetch.apply(this, arguments);
+        // 调用原始的open方法
+        return originalOpen.apply(this, arguments);
     };
 })();
