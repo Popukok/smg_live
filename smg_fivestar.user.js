@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.8
+// @version          0.9
 // @description      打开网页即可收看SMGTV，并解除试看倒计时与切页暂停等限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -23,9 +23,105 @@
     const VIDEO_READY_EVENTS = ['loadeddata', 'canplay', 'playing', 'timeupdate', 'progress'];
     const VIDEO_RESET_EVENTS = ['loadstart', 'waiting', 'stalled', 'emptied'];
     const watchedVideos = new WeakSet();
+    const streamAddressCache = Object.create(null);
     let fullscreenFallbackTarget = null;
     let cssFullscreenFallbackPlayer = null;
     let lastFullscreenActionAt = 0;
+    function rememberStreamAddresses(channelId, liveAddress, shiftAddress) {
+        if (channelId == null || channelId === '') {
+            return;
+        }
+        const key = String(channelId);
+        const prev = streamAddressCache[key] || { live_address: '', shift_address: '' };
+        streamAddressCache[key] = {
+            live_address: liveAddress || prev.live_address || '',
+            shift_address: shiftAddress || prev.shift_address || ''
+        };
+    }
+    function fillStreamAddresses(target, channelId) {
+        if (!target) {
+            return false;
+        }
+        const cached = streamAddressCache[String(channelId)] || {};
+        let changed = false;
+        if (!target.live_address && cached.live_address) {
+            target.live_address = cached.live_address;
+            changed = true;
+        }
+        if (!target.shift_address && cached.shift_address) {
+            target.shift_address = cached.shift_address;
+            changed = true;
+        }
+        rememberStreamAddresses(channelId, target.live_address, target.shift_address);
+        return changed;
+    }
+    function getResultChannelId(result) {
+        return result?.channel_id || result?.channel_info?.id || result?.id;
+    }
+    function unlockProgramFlags(target) {
+        if (!target) {
+            return;
+        }
+        target.is_shield = 0;
+        target.is_review = 1;
+        target.can_review = 1;
+    }
+    function ensurePlayableStream(component) {
+        if (!component) {
+            return;
+        }
+        unlockProgramFlags(component.programObj);
+        const channelDetail = component.currChannelDetail;
+        if (channelDetail) {
+            rememberStreamAddresses(channelDetail.id, channelDetail.live_address, channelDetail.shift_address);
+        }
+        const detail = component.programDetail;
+        if (!detail) {
+            return;
+        }
+        unlockProgramFlags(detail);
+        if (detail.is_exist_pad && !(detail.pad_video_info && detail.pad_video_info.play_url)) {
+            detail.is_exist_pad = 0;
+            detail.pad_src = '';
+        }
+        if (!detail.channel_info) {
+            detail.channel_info = {};
+        }
+        const channelId = getResultChannelId(detail) || channelDetail?.id;
+        if (channelDetail) {
+            if (!detail.channel_info.live_address && channelDetail.live_address) {
+                detail.channel_info.live_address = channelDetail.live_address;
+            }
+            if (!detail.channel_info.shift_address && channelDetail.shift_address) {
+                detail.channel_info.shift_address = channelDetail.shift_address;
+            }
+        }
+        if (fillStreamAddresses(detail.channel_info, channelId)) {
+            console.log('[SMGTV] 已回填频道直播地址');
+        }
+    }
+    function recoverPlayerIfNeeded(component) {
+        if (!component || typeof component.initPlayer !== 'function' || component.__smgRecovering) {
+            return;
+        }
+        const video = getPlayerVideo(component);
+        const mediaError = video?.error;
+        if (!(component.player && mediaError && mediaError.code === 4)) {
+            return;
+        }
+        ensurePlayableStream(component);
+        const hasLive = !!(component.programDetail?.channel_info?.live_address ||
+            component.currChannelDetail?.live_address);
+        if (!hasLive) {
+            return;
+        }
+        component.__smgRecovering = true;
+        console.log('[SMGTV] 检测到无效播放地址，正在重新初始化播放器');
+        component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
+        setTimeout(() => {
+            component.__smgRecovering = false;
+        }, 2000);
+    }
     function injectStyle(cssText) {
         const appendStyle = () => {
             if (document.getElementById(STYLE_ID)) {
@@ -93,6 +189,7 @@
         target?.classList?.toggle(VIDEO_READY_CLASS, isReady);
     }
     function syncLoadingState(component) {
+        recoverPlayerIfNeeded(component);
         const video = getPlayerVideo(component);
         if (video) {
             watchPlayerVideo(component, video);
@@ -331,8 +428,10 @@
             return;
         }
         const wrapped = function() {
+            ensurePlayableStream(this);
             const result = original.apply(this, arguments);
             const runAfter = () => {
+                ensurePlayableStream(this);
                 setTimeout(() => after(this), 0);
                 setTimeout(() => after(this), 250);
                 setTimeout(() => after(this), 1000);
@@ -385,9 +484,10 @@
             window.removeEventListener('unload', component._handlerUnload);
             component._handlerUnload = null;
         }
-        ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel'].forEach(methodName => {
+        ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel', 'getProgramDetail'].forEach(methodName => {
             wrapComponentMethod(component, methodName, syncLoadingState);
         });
+        ensurePlayableStream(component);
         syncLoadingState(component);
         console.log('[SMGTV] 页面限制补丁已生效');
     }
@@ -489,6 +589,55 @@
             return String(url).includes('/content/pc/tv/');
         }
     }
+    function rewriteTvApiResponse(requestUrl, response) {
+        let modified = false;
+        if (!response || typeof response !== 'object') {
+            return false;
+        }
+        if (requestUrl.includes('/channel/detail') && response.result) {
+            rememberStreamAddresses(
+                response.result.id,
+                response.result.live_address,
+                response.result.shift_address
+            );
+        }
+        if (requestUrl.includes('/program/detail') && response.result) {
+            unlockProgramFlags(response.result);
+            if (response.result.channel_info) {
+                unlockProgramFlags(response.result.channel_info);
+            } else {
+                response.result.channel_info = {};
+            }
+            const channelId = getResultChannelId(response.result);
+            if (fillStreamAddresses(response.result.channel_info, channelId)) {
+                console.log('[SMGTV] 已从频道详情回填节目直播地址');
+            }
+            modified = true;
+        }
+        if (requestUrl.includes('/programs') && response.result?.programs) {
+            response.result.programs.forEach(program => {
+                unlockProgramFlags(program);
+                modified = true;
+            });
+        }
+        return modified;
+    }
+    function replaceXhrResponse(xhr, body) {
+        try {
+            Object.defineProperty(xhr, 'responseText', {
+                value: body,
+                writable: false,
+                configurable: true
+            });
+            Object.defineProperty(xhr, 'response', {
+                value: body,
+                writable: false,
+                configurable: true
+            });
+        } catch (e) {
+            console.error('[SMGTV] 重写接口响应失败:', e);
+        }
+    }
     XMLHttpRequest.prototype.open = function(method, url) {
         const requestUrl = String(url);
         // 检查是否是目标API请求
@@ -497,33 +646,10 @@
             this.addEventListener('readystatechange', function() {
                 if (this.readyState === 4 && this.status === 200) {
                     try {
-                        // 解析响应数据
-                        const response = JSON.parse(this.responseText);
-                        let modified = false;
-
-                        // 处理单个节目详情接口
-                        if (requestUrl.includes('/program/detail') && response.result) {
-                            response.result.is_shield = 0;
-                            response.result.is_review = 1;
-                            response.result.can_review = 1;
-                            modified = true;
-                        }
-                        // 处理节目列表接口
-                        if (requestUrl.includes('/programs') && response.result?.programs) {
-                            response.result.programs.forEach(program => {
-                                program.is_shield = 0;
-                                program.is_review = 1;
-                                program.can_review = 1;
-                                modified = true;
-                            });
-                        }
-
-                        if (modified) {
-                            // 重写responseText属性
-                            Object.defineProperty(this, 'responseText', {
-                                value: JSON.stringify(response),
-                                writable: false
-                            });
+                        const raw = this.responseText;
+                        const response = JSON.parse(raw);
+                        if (rewriteTvApiResponse(requestUrl, response)) {
+                            replaceXhrResponse(this, JSON.stringify(response));
                         }
                     } catch (e) {
                         console.error('解析JSON响应时出错:', e);
@@ -535,6 +661,37 @@
         // 调用原始的open方法
         return originalOpen.apply(this, arguments);
     };
+    const originalFetch = window.fetch;
+    if (typeof originalFetch === 'function') {
+        window.fetch = function(input, init) {
+            const requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
+            const request = originalFetch.apply(this, arguments);
+            if (!isTargetTVApi(requestUrl)) {
+                return request;
+            }
+            return request.then(res => {
+                if (!res || !res.ok) {
+                    return res;
+                }
+                return res.clone().text().then(raw => {
+                    try {
+                        const response = JSON.parse(raw);
+                        if (!rewriteTvApiResponse(requestUrl, response)) {
+                            return res;
+                        }
+                        return new Response(JSON.stringify(response), {
+                            status: res.status,
+                            statusText: res.statusText,
+                            headers: res.headers
+                        });
+                    } catch (e) {
+                        console.error('解析JSON响应时出错:', e);
+                        return res;
+                    }
+                });
+            });
+        };
+    }
     if (document.readyState === 'complete') {
         initComponentPatch();
     } else {
