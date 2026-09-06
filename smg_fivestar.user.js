@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.17
-// @description      收看SMGTV，并解除页面部分限制
+// @version          0.18
+// @description      收看SMGTV，并解除页面部分限制（0.18：支持跨日回看锚点捕获，修复五星体育无直播源问题）
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
@@ -103,6 +103,11 @@
     function forceOpenProgram(program) {
         if (!program) {
             return;
+        }
+        // 先留存服务端原始值：can_review/is_review 会被下方解锁改写，
+        // 但锚点捕获逻辑需要依赖"服务端真实可回看"来判断节目详情是否会签发流地址
+        if (program.__smgServerCanReview == null && (program.can_review === 0 || program.can_review === 1)) {
+            program.__smgServerCanReview = program.can_review;
         }
         program.is_shield = 0;
         program.can_review = 1;
@@ -268,10 +273,24 @@
     function findSportsNewsAnchor(component) {
         const lists = [component?.currentProgramList, component?.playingProgramList, component?.slitProgramList];
         const isEnded = p => p && p.id && p.isOutDate === 0 && p.play === 0;
+        const dead = component.__smgDeadAnchors;
+        const notDead = p => p && !(dead && dead.has(p.id));
+        // 注意：is_review 会被 forceOpenProgram 统一改写为 1，不能再作为"服务端可回看"依据，
+        // 这里用改写前留存的服务端原始 can_review（__smgServerCanReview）判断
+        const nameMatch = p => notDead(p) && typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1;
         for (const list of lists) {
             if (!Array.isArray(list)) continue;
             for (const p of list) {
-                if (isEnded(p) && typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1) {
+                if (isEnded(p) && nameMatch(p) && p.__smgServerCanReview === 1) {
+                    return p;
+                }
+            }
+        }
+        for (const list of lists) {
+            if (!Array.isArray(list)) continue;
+            // 名称命中即可尝试（个别日期行内未带 can_review 标记，以节目详情返回为准）
+            for (const p of list) {
+                if (isEnded(p) && nameMatch(p)) {
                     return p;
                 }
             }
@@ -279,7 +298,7 @@
         for (const list of lists) {
             if (!Array.isArray(list)) continue;
             for (const p of list) {
-                if (isEnded(p) && p.is_review === 1) {
+                if (isEnded(p) && notDead(p) && p.__smgServerCanReview === 1) {
                     return p;
                 }
             }
@@ -303,6 +322,122 @@
         }
         return null;
     }
+    const CROSS_DAY_MAX_BACK = 7;
+    const CROSS_DAY_RETRY_MS = 60 * 1000;
+    function markDeadAnchor(component, anchorId) {
+        if (!component || anchorId == null) {
+            return;
+        }
+        if (!component.__smgDeadAnchors) {
+            component.__smgDeadAnchors = new Set();
+        }
+        component.__smgDeadAnchors.add(anchorId);
+    }
+    function triggerFlashCapture(component, anchor) {
+        const restore = getRestoreProgram(component, anchor);
+        if (!restore || typeof component.changeProgram !== 'function') {
+            // 没有可切回的节目，暂不闪切；记录失败锚点并等待下一次机会
+            markDeadAnchor(component, anchor && anchor.id);
+            component.__smgNeedShiftBase = true;
+            return;
+        }
+        component.__smgNeedShiftBase = false;
+        component.__smgAutoFlashAnchorId = anchor.id;
+        component.__smgAutoFlashTarget = restore;
+        try {
+            component.changeProgram(anchor);
+        } catch (e) {
+            console.warn('[SMGTV] 兜底捕获触发失败:', e);
+            component.__smgAutoFlashTarget = null;
+            markDeadAnchor(component, anchor.id);
+            component.__smgNeedShiftBase = true;
+        }
+        setTimeout(() => {
+            const canRestore = component && component.__smgAutoFlashTarget &&
+                !component.__smgAutoFlashScheduled &&
+                component.programObj?.id === component.__smgAutoFlashAnchorId;
+            if (canRestore && typeof component.changeProgram === 'function') {
+                component.__smgAutoFlashTarget = null;
+                component.__smgAutoFlashAnchorId = null;
+                // 2500ms 内未能完成捕获（服务端未签发地址 / 无 start 窗口），
+                // 拉黑该锚点避免反复横跳，并允许继续寻找其他可用锚点
+                markDeadAnchor(component, anchor.id);
+                component.__smgNeedShiftBase = true;
+                try {
+                    component.changeProgram(restore);
+                } catch (e) {
+                    console.warn('[SMGTV] 兜底捕获切回失败:', e);
+                }
+            }
+        }, 2500);
+    }
+    function restoreComponentDate(component, originalDate) {
+        if (!component || !originalDate || component.activeDate === originalDate) {
+            return Promise.resolve();
+        }
+        try {
+            component.activeDate = originalDate;
+            if (typeof component.refreshProgramList === 'function') {
+                return Promise.resolve(component.refreshProgramList(false)).then(() => undefined);
+            }
+        } catch (e) {
+            console.warn('[SMGTV] 跨日扫描日期还原失败:', e);
+        }
+        return Promise.resolve();
+    }
+    function findCrossDayAnchor(component) {
+        // 当天节目单尚无"已结束且可回看"的锚点（体育新闻一般在傍晚才播出）时，
+        // 依次查看最近几天历史节目单：历史可回看节目现在仍可播放，
+        // 服务端照常签发带 token 的时移地址，捕获 base 后即可解锁本频道任意节目/直播。
+        if (typeof component.refreshProgramList !== 'function' || !component.activeDate) {
+            return Promise.resolve(null);
+        }
+        const originalDate = component.activeDate;
+        const scanChannelId = component.currChannel?.id;
+        let offset = 0;
+        const attempt = () => {
+            if (component.currChannel?.id !== scanChannelId) {
+                // 扫描过程中用户切换了频道，放弃本次扫描
+                return restoreComponentDate(component, originalDate).then(() => null);
+            }
+            if (offset >= CROSS_DAY_MAX_BACK) {
+                return restoreComponentDate(component, originalDate).then(() => null);
+            }
+            offset += 1;
+            const d = new Date();
+            d.setDate(d.getDate() - offset);
+            const pad = n => String(n).padStart(2, '0');
+            const dateStr = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+            try {
+                component.activeDate = { dateStr: dateStr };
+            } catch (e) {
+                return restoreComponentDate(component, originalDate).then(() => null);
+            }
+            return Promise.resolve(component.refreshProgramList(false))
+                .then(() => new Promise(r => setTimeout(r, 350)))
+                .then(() => {
+                    const anchor = findSportsNewsAnchor(component);
+                    if (anchor) {
+                        const copy = Object.assign({}, anchor, {
+                            is_shield: 0,
+                            can_review: 1,
+                            is_review: 1,
+                            isOutDate: 0
+                        });
+                        return restoreComponentDate(component, originalDate).then(() => copy);
+                    }
+                    return attempt();
+                })
+                .catch(() => attempt());
+        };
+        return attempt().then(found => {
+            if (component && component.currentProgramList && component.currentProgramList.length === 0 &&
+                typeof component.refreshProgramList === 'function') {
+                restoreComponentDate(component, originalDate);
+            }
+            return found;
+        });
+    }
     function maybeAutoCaptureShift(component, fromMonitor) {
         if (!component || !component.__smgPatched || !component.__smgNeedShiftBase || !fromMonitor) {
             return;
@@ -322,6 +457,9 @@
             !!(channelLiveBaseCache[chId] && channelLiveBaseCache[chId].exp > now);
         if (hasBase) {
             component.__smgNeedShiftBase = false;
+            if (component.__smgDeadAnchors) {
+                component.__smgDeadAnchors.clear();
+            }
             return;
         }
         if (String(chId) !== '10') {
@@ -329,37 +467,28 @@
             return;
         }
         const anchor = findSportsNewsAnchor(component);
-        if (!anchor) {
-            component.__smgNeedShiftBase = false;
+        if (anchor) {
+            triggerFlashCapture(component, anchor);
             return;
         }
-        const restore = getRestoreProgram(component, anchor);
-        if (!restore || typeof component.changeProgram !== 'function') {
-            return;
+        // 当天无可用锚点：启动跨日历史节目单扫描（节流 + 防重入），成功后再做闪切捕获
+        if (!component.__smgCrossDayScanning && !component.__smgAutoFlashScheduled) {
+            const lastTry = component.__smgCrossDayScanAt || 0;
+            if (now - lastTry >= CROSS_DAY_RETRY_MS) {
+                component.__smgCrossDayScanAt = now;
+                component.__smgCrossDayScanning = true;
+                component.__smgNeedShiftBase = false;
+                findCrossDayAnchor(component).then(found => {
+                    component.__smgCrossDayScanning = false;
+                    if (found && component.currChannel && String(component.currChannel.id) === '10') {
+                        triggerFlashCapture(component, found);
+                    }
+                }).catch(() => {
+                    component.__smgCrossDayScanning = false;
+                });
+            }
         }
         component.__smgNeedShiftBase = false;
-        component.__smgAutoFlashAnchorId = anchor.id;
-        component.__smgAutoFlashTarget = restore;
-        try {
-            component.changeProgram(anchor);
-        } catch (e) {
-            console.warn('[SMGTV] 兜底捕获触发失败:', e);
-            component.__smgAutoFlashTarget = null;
-        }
-        setTimeout(() => {
-            const canRestore = component && component.__smgAutoFlashTarget &&
-                !component.__smgAutoFlashScheduled &&
-                component.programObj?.id === component.__smgAutoFlashAnchorId;
-            if (canRestore && typeof component.changeProgram === 'function') {
-                component.__smgAutoFlashTarget = null;
-                component.__smgAutoFlashAnchorId = null;
-                try {
-                    component.changeProgram(restore);
-                } catch (e) {
-                    console.warn('[SMGTV] 兜底捕获切回失败:', e);
-                }
-            }
-        }, 2500);
     }
     function recoverPlayerIfNeeded(component) {
         if (!component || typeof component.initPlayer !== 'function' || component.__smgRecovering) {
