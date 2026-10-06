@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.23
+// @version          0.24
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -29,6 +29,7 @@
     const FULLSCREEN_FALLBACK_CLASS = 'smgtv-fallback-fullscreen';
     const FULLSCREEN_TARGET_CLASS = 'smgtv-fallback-fullscreen-target';
     const FULLSCREEN_BUTTON_SELECTOR = '.xgplayer-fullscreen';
+    const FULLSCREEN_HOST_SELECTOR = '.live-player, .player-box';
     const VIDEO_READY_EVENTS = ['loadeddata', 'canplay', 'playing', 'timeupdate', 'progress'];
     const VIDEO_RESET_EVENTS = ['loadstart', 'waiting', 'stalled', 'emptied'];
     const watchedVideos = new WeakSet();
@@ -41,6 +42,8 @@
     const SCAN_DAYS_PER_TRY = 2;
     const SCAN_STEP_DELAY_MS = 1200;
     const DONOR_MEMO_TTL_MS = 30 * 60 * 1000;
+    const PREFETCH_SHIFT_DELAY_MS = 6000;
+    const PREFETCH_SHIFT_RETRY_MS = 2 * 60 * 1000;
     const shiftScanCursor = Object.create(null);
     const donorMemo = Object.create(null);
     const STREAM_NO_EXP_TTL_MS = 20 * 60 * 1000;
@@ -393,6 +396,12 @@
     let fullscreenFallbackTarget = null;
     let cssFullscreenFallbackPlayer = null;
     let lastFullscreenActionAt = 0;
+    let nativeFullscreenHost = null;
+    let nativeFullscreenHostAt = 0;
+    let wantFullscreen = false;
+    let fsRestoreTries = 0;
+    let rebuildFullscreenGuard = 0;
+    let exitFullscreenGuardInstalled = false;
     const logThrottle = Object.create(null);
     function throttleLog(key, intervalMs, fn) {
         const now = Date.now();
@@ -401,6 +410,16 @@
         }
         logThrottle[key] = now;
         fn();
+    }
+    const baseLogState = { key: '' };
+    function noteBaseEvent(key, log) {
+        if (key === baseLogState.key) {
+            return;
+        }
+        baseLogState.key = key;
+        if (log) {
+            log();
+        }
     }
     function rememberStreamAddresses(channelId, liveAddress, shiftAddress) {
         if (channelId == null || channelId === '') {
@@ -563,17 +582,109 @@
             .filter(entry => entry && entry.url && baseExpiryOf(entry) - BASE_SAFETY_MS > now &&
                              (kind === 'shift' || !key || !entry.key || entry.key === key));
         if (!usable.length) {
-            throttleLog('base-miss-' + channelId, 3000, () => {
+            noteBaseEvent('miss|' + channelId + '|' + (kind || 'live') + '|' + (key || '-'), () => {
                 dlog('[dev] 基底未命中 ch=' + channelId, 'kind=' + (kind || 'live'), 'key=' + (key || '-'));
             });
             return null;
         }
         const best = usable.reduce(betterBase);
-        throttleLog('base-hit-' + channelId, 3000, () => {
-            dlog('[dev] 基底命中 ch=' + channelId, 'src=' + best.src,
-                 '剩余=' + Math.round((baseExpiryOf(best) - now) / 1000) + 's');
+        const left = Math.round((baseExpiryOf(best) - now) / 1000);
+        const bucket = left > 180 ? 3 : left > 120 ? 2 : left > 90 ? 1 : 0;
+        noteBaseEvent('hit|' + channelId + '|' + best.src + '|' + (best.key || '') + '|' + bucket, () => {
+            dlog('[dev] 基底命中 ch=' + channelId, 'src=' + best.src, '剩余=' + left + 's');
         });
         return best;
+    }
+    function rewritePlayerConfig(component, config, isProbe) {
+        const program = component.programObj;
+        const channelId = getCompChannelId(component);
+        let url = (config.url && typeof config.url === 'string') ? config.url : '';
+        const hasStream = /\.m3u8/.test(url);
+        const hasWindow = /\bstart=\d/.test(url);
+        if (channelId != null && hasStream) {
+            const base = stripTimeWindow(url);
+            if (base) {
+                const fromShift = /[?&]start=\d+/.test(url);
+                const store = fromShift ? channelShiftBaseCache : channelLiveBaseCache;
+                const entry = { url: base, at: Date.now(), exp: parseStreamExpiry(url),
+                                key: fromShift ? '' : playbackKey(component), src: 'page' };
+                const prev = store[channelId];
+                const canStore = !prev || prev.key !== entry.key ||
+                      (entry.exp != null && (prev.exp == null || entry.exp >= prev.exp)) ||
+                      (entry.exp == null && prev.exp == null);
+                if (canStore) {
+                    store[channelId] = entry;
+                    console.log(fromShift ? '[SMGTV] 已抓取回看源' : '[SMGTV] 已抓取直播源');
+                }
+            }
+        }
+        const isReplay = config.isLive === false;
+        const pbKey = playbackKey(component);
+        const baseEntry = resolveBaseEntry(channelId, isReplay ? 'shift' : '', pbKey);
+        const baseOk = baseEntry ? baseEntry.url : '';
+        const urlExp = parseStreamExpiry(url);
+        const urlStale = hasStream && urlExp != null && urlExp - BASE_SAFETY_MS <= Date.now();
+        const forcing = Date.now() < (component.__smgPreferFreshBaseUntil || 0);
+        const staleTrigger = urlStale && (isReplay || canAutoAcquire(channelId));
+        const preferBase = !!baseEntry &&
+              (!hasStream || staleTrigger || (forcing && baseExpiryOf(baseEntry) > (urlExp || 0)));
+        dlog('[dev] ' + (isProbe ? '续期取址' : 'new播放器') + ' ch=' + channelId,
+             'key=' + (pbKey || '-'), 'isLive=', config.isLive,
+             'url=' + (url || '(空)'), 'base=' + (baseEntry ? baseEntry.src : '无'),
+             'preferBase=', preferBase, 'staleTrigger=', staleTrigger, 'hasWindow=', hasWindow,
+             'play=' + (program ? program.play : '-'),
+             'prog=' + (program && program.name ? String(program.name).slice(0, 12) : '-'));
+        if (isReplay && hasWindow) {
+            dlog('[dev] 页面自带 start/end，不改写');
+            return;
+        }
+        if (isReplay && hasStream && !hasWindow && program?.start_time && program?.end_time) {
+            if (!preferBase && staleTrigger) {
+                component.__smgNeedShiftBase = true;
+            }
+            const useUrl = preferBase ? baseOk : url;
+            if (preferBase) {
+                component.__smgPreferFreshBaseUntil = 0;
+            }
+            config.url = useUrl + (useUrl.includes('?') ? '&' : '?') +
+                'start=' + program.start_time + '&end=' + program.end_time;
+        } else if (isReplay && !hasStream && program?.start_time && program?.end_time) {
+            if (baseOk) {
+                component.__smgPreferFreshBaseUntil = 0;
+                config.url = baseOk + '&start=' + program.start_time + '&end=' + program.end_time;
+                if (!isProbe) {
+                    console.log('[SMGTV] 已注入回放 频道' + channelId);
+                }
+            } else {
+                component.__smgNeedShiftBase = true;
+                dlog('[dev] 回看无基底可注入 → 标记待取源');
+            }
+        } else if (!isReplay) {
+            if (preferBase) {
+                config.url = baseOk;
+                component.__smgPreferFreshBaseUntil = 0;
+                if (!isProbe) {
+                    console.log('[SMGTV] 已注入直播 频道' + channelId + (urlStale ? '（旧地址已过期）' : ''));
+                }
+            } else if (!hasStream || staleTrigger) {
+                component.__smgNeedShiftBase = true;
+            }
+        }
+        dlog('[dev] 最终 url=' + (config.url || '(空)'));
+    }
+    function computeCurrentStreamUrl(component) {
+        const prog = component && component.programObj;
+        if (!prog) {
+            return '';
+        }
+        const probe = { url: '', isLive: prog.play !== 0 };
+        try {
+            rewritePlayerConfig(component, probe, true);
+        } catch (e) {
+            dlog('[dev] 续期取址异常：' + (e && e.message));
+            return '';
+        }
+        return typeof probe.url === 'string' ? probe.url : '';
     }
     function installReplayUrlPatch(component) {
         const XGPlayer = component.$xgplayer;
@@ -583,77 +694,7 @@
         component.__smgReplayPatchInstalled = true;
         component.$xgplayer = new Proxy(XGPlayer, {
             construct(target, args) {
-                const config = args[0] || {};
-                const program = component.programObj;
-                const channelId = getCompChannelId(component);
-                let url = (config.url && typeof config.url === 'string') ? config.url : '';
-                const hasStream = /\.m3u8/.test(url);
-                const hasWindow = /\bstart=\d/.test(url);
-                if (channelId != null && hasStream) {
-                    const base = stripTimeWindow(url);
-                    if (base) {
-                        const fromShift = /[?&]start=\d+/.test(url);
-                        const store = fromShift ? channelShiftBaseCache : channelLiveBaseCache;
-                        const entry = { url: base, at: Date.now(), exp: parseStreamExpiry(url),
-                                        key: fromShift ? '' : playbackKey(component), src: 'page' };
-                        const prev = store[channelId];
-                        const canStore = !prev || prev.key !== entry.key ||
-                              (entry.exp != null && (prev.exp == null || entry.exp >= prev.exp)) ||
-                              (entry.exp == null && prev.exp == null);
-                        if (canStore) {
-                            store[channelId] = entry;
-                            console.log(fromShift ? '[SMGTV] 已抓取回看源' : '[SMGTV] 已抓取直播源');
-                        }
-                    }
-                }
-                const isReplay = config.isLive === false;
-                const pbKey = playbackKey(component);
-                const baseEntry = resolveBaseEntry(channelId, isReplay ? 'shift' : '', pbKey);
-                const baseOk = baseEntry ? baseEntry.url : '';
-                const urlExp = parseStreamExpiry(url);
-                const urlStale = hasStream && urlExp != null && urlExp - BASE_SAFETY_MS <= Date.now();
-                const forcing = Date.now() < (component.__smgPreferFreshBaseUntil || 0);
-                const staleTrigger = urlStale && (isReplay || canAutoAcquire(channelId));
-                const preferBase = !!baseEntry &&
-                      (!hasStream || staleTrigger || (forcing && baseExpiryOf(baseEntry) > (urlExp || 0)));
-                dlog('[dev] new播放器 ch=' + channelId, 'key=' + (pbKey || '-'), 'isLive=', config.isLive,
-                     'url=' + (url || '(空)'), 'base=' + (baseEntry ? baseEntry.src : '无'),
-                     'preferBase=', preferBase, 'staleTrigger=', staleTrigger, 'hasWindow=', hasWindow,
-                     'play=' + (program ? program.play : '-'),
-                     'prog=' + (program && program.name ? String(program.name).slice(0, 12) : '-'));
-                if (isReplay && hasWindow) {
-                    dlog('[dev] 页面自带 start/end，不改写');
-                    return new target(...args);
-                }
-                if (isReplay && hasStream && !hasWindow && program?.start_time && program?.end_time) {
-                    if (!preferBase && staleTrigger) {
-                        component.__smgNeedShiftBase = true;
-                    }
-                    const useUrl = preferBase ? baseOk : url;
-                    if (preferBase) {
-                        component.__smgPreferFreshBaseUntil = 0;
-                    }
-                    config.url = useUrl + (useUrl.includes('?') ? '&' : '?') +
-                        'start=' + program.start_time + '&end=' + program.end_time;
-                } else if (isReplay && !hasStream && program?.start_time && program?.end_time) {
-                    if (baseOk) {
-                        component.__smgPreferFreshBaseUntil = 0;
-                        config.url = baseOk + '&start=' + program.start_time + '&end=' + program.end_time;
-                        console.log('[SMGTV] 已注入回放 频道' + channelId);
-                    } else {
-                        component.__smgNeedShiftBase = true;
-                        dlog('[dev] 回看无基底可注入 → 标记待取源');
-                    }
-                } else if (!isReplay) {
-                    if (preferBase) {
-                        config.url = baseOk;
-                        component.__smgPreferFreshBaseUntil = 0;
-                        console.log('[SMGTV] 已注入直播 频道' + channelId + (urlStale ? '（旧地址已过期）' : ''));
-                    } else if (!hasStream || staleTrigger) {
-                        component.__smgNeedShiftBase = true;
-                    }
-                }
-                dlog('[dev] 最终 url=' + (config.url || '(空)'));
+                rewritePlayerConfig(component, args[0] || {}, false);
                 return new target(...args);
             }
         });
@@ -910,10 +951,17 @@
             component.__smgAcquiring = false;
             crossTabRelease();
             if (ok) {
+                const pendingReplay = !!(opts.prefetch && component.programObj && component.programObj.play === 0);
                 component[cooldownKey] = 0;
                 component.__smgAcquireFails = 0;
                 component.__smgNeedShiftBase = false;
-                if (component && typeof component.initPlayer === 'function' && opts.rebuild !== false) {
+                if (opts.prefetch) {
+                    dlog('[dev] 后台预热完成 ch=' + chId +
+                         (pendingReplay ? '（用户已切回看，立即重建）' : '（不重建播放器）'));
+                }
+                const swapped = !!(opts.inPlace && applyStreamUrlInPlace(component, opts.reason || '续期'));
+                if (!swapped && component && typeof component.initPlayer === 'function' &&
+                        (opts.rebuild !== false || pendingReplay)) {
                     rememberPlaybackPosition(component, getPlayerVideo(component));
                     if (isMobileSite()) {
                         const prog = component.programObj;
@@ -923,6 +971,12 @@
                     }
                 }
             } else {
+                if (opts.prefetch) {
+                    component[cooldownKey] = 0;
+                    component.__smgAcquireFails = 0;
+                    dlog('[dev] 后台预热未取到源（不占冷却，用户切回看时仍会立刻再试）');
+                    return;
+                }
                 component.__smgAcquireFails = (component.__smgAcquireFails || 0) + 1;
                 if (component.__smgAcquireFails >= 3) {
                     component[cooldownKey] = now + 10 * 60 * 1000;
@@ -932,7 +986,78 @@
         });
         return true;
     }
-    function forceRenewStream(component, reason, rebuild) {
+    function maybePrefetchShiftBase(component) {
+        if (!component || !component.__smgPatched) {
+            return false;
+        }
+        const chId = getCompChannelId(component);
+        if (chId == null || !canAutoAcquire(chId)) {
+            return false;
+        }
+        const prog = component.programObj;
+        if (!prog || prog.play !== 1) {
+            return false;
+        }
+        const cached = channelShiftBaseCache[chId];
+        if (cached && cached.url && baseExpiryOf(cached) - BASE_SAFETY_MS > Date.now()) {
+            return false;
+        }
+        if (!component.__smgWatchAt) {
+            component.__smgWatchAt = Date.now();
+            return false;
+        }
+        if (Date.now() - component.__smgWatchAt < PREFETCH_SHIFT_DELAY_MS) {
+            return false;
+        }
+        if (component.__smgAcquiring ||
+                Date.now() - (component.__smgPrefetchAt || 0) < PREFETCH_SHIFT_RETRY_MS) {
+            return false;
+        }
+        component.__smgPrefetchAt = Date.now();
+        component.__smgWatchAt = Date.now();
+        dlog('[dev] 后台预热回看基底 ch=' + chId);
+        component.__smgNeedShiftBase = true;
+        return maybeAutoCaptureShift(component, true, { force: true, rebuild: false, prefetch: true });
+    }
+    function applyStreamUrlInPlace(component, reason) {
+        const player = component && component.player;
+        if (!player || typeof player.switchURL !== 'function') {
+            dlog('[dev] 就地换源：播放器不支持 switchURL → 回退重建');
+            return false;
+        }
+        if (player.root && player.root.isConnected === false) {
+            dlog('[dev] 就地换源：播放器实例已脱离文档 → 回退重建');
+            return false;
+        }
+        const url = computeCurrentStreamUrl(component);
+        if (!url) {
+            dlog('[dev] 就地换源：取不到可用地址 → 回退重建');
+            return false;
+        }
+        const isReplay = component.programObj?.play === 0;
+        const video = getPlayerVideo(component);
+        const wasPaused = !!(video && video.paused);
+        try {
+            const ret = player.switchURL(url, isReplay ? undefined : { startTime: 0 });
+            console.log('[SMGTV] 播放源续期（' + reason + '）已就地换源，不重建播放器');
+            dlog('[dev] 就地换源 模式=' + (isReplay ? '回看(按进度续播)' : '直播(回直播边缘)'),
+                 'url=' + String(url).slice(0, 90));
+            if (ret && typeof ret.then === 'function') {
+                ret.then(() => {
+                    if (wasPaused) {
+                        try { player.pause(); } catch (e) {}
+                    }
+                }).catch(err => {
+                    console.warn('[SMGTV] 就地换源未完成：', err && err.message ? err.message : err);
+                });
+            }
+            return true;
+        } catch (e) {
+            dlog('[dev] 就地换源抛错：' + (e && e.message) + ' → 回退重建');
+            return false;
+        }
+    }
+    function forceRenewStream(component, reason, rebuild, inPlace) {
         const chId = getCompChannelId(component);
         if (chId == null) {
             return false;
@@ -941,10 +1066,11 @@
             console.log('[SMGTV] 播放源失效（' + reason + '），正在重新获取 频道' + chId);
         });
         component.__smgNeedShiftBase = true;
-        if (rebuild) {
+        if (rebuild || inPlace) {
             component.__smgPreferFreshBaseUntil = Date.now() + 30000;
         }
-        return maybeAutoCaptureShift(component, true, { force: true, rebuild: rebuild !== false });
+        return maybeAutoCaptureShift(component, true,
+            { force: true, rebuild: rebuild !== false, inPlace: !!inPlace, reason: reason });
     }
     function detectPlaybackFailure(component, video) {
         if (!video) {
@@ -1103,6 +1229,8 @@
         component.__smgStallWatch = null;
         clearResumePosition(component);
         component.__smgPreferFreshBaseUntil = 0;
+        component.__smgWatchAt = 0;
+        component.__smgPrefetchAt = 0;
         clearStuckStart(component);
     }
     function maintainStreamFreshness(component) {
@@ -1128,16 +1256,20 @@
             ? Math.min(STREAM_RENEW_MARGIN_MS, Math.max(lifetime * 0.15, 15000))
             : STREAM_RENEW_MARGIN_MS;
         const left = exp - now;
-        throttleLog('renew-check-' + chId, 15000, () => {
-            dlog('[dev] 续期检查：剩余=' + Math.round(left / 1000) + 's',
-                 '阈值=' + Math.round(margin / 1000) + 's',
-                 '来源=' + (entry ? entry.src : 'url'));
-        });
+        if (left <= margin + 60000) {
+            throttleLog('renew-check-' + chId, 30000, () => {
+                dlog('[dev] 续期检查：剩余=' + Math.round(left / 1000) + 's',
+                     '阈值=' + Math.round(margin / 1000) + 's',
+                     '来源=' + (entry ? entry.src : 'url'));
+            });
+        }
         if (left > margin) {
             return;
         }
         if (component.__smgRenewedExp === exp) {
-            dlog('[dev] 该期限已续期过，不再重复');
+            throttleLog('renew-done-' + chId, 60000, () => {
+                dlog('[dev] 该期限已续期过，不再重复');
+            });
             return;
         }
         if (now - (component.__smgLastRenewAt || 0) < STREAM_RENEW_COOLDOWN_MS) {
@@ -1154,7 +1286,7 @@
             component.__smgPreferFreshBaseUntil = now + 30000;
             rememberPlaybackPosition(component, video);
         }
-        forceRenewStream(component, '地址临近到期', canRebuild);
+        forceRenewStream(component, '地址临近到期', canRebuild, true);
     }
     function injectStyle(cssText) {
         const appendStyle = () => {
@@ -1306,8 +1438,16 @@
         VIDEO_RESET_EVENTS.forEach(eventName => {
             video.addEventListener(eventName, resetReady, { passive: true });
         });
-        video.addEventListener('webkitbeginfullscreen', () => syncFullscreenButtonState(component, true), { passive: true });
-        video.addEventListener('webkitendfullscreen', () => syncFullscreenButtonState(component, false), { passive: true });
+        video.addEventListener('webkitbeginfullscreen', () => {
+            wantFullscreen = true;
+            dlog('[dev] iOS 视频进入原生全屏');
+            syncFullscreenButtonState(component, true);
+        }, { passive: true });
+        video.addEventListener('webkitendfullscreen', () => {
+            wantFullscreen = false;
+            dlog('[dev] iOS 视频退出原生全屏 → 清除全屏意图');
+            syncFullscreenButtonState(component, false);
+        }, { passive: true });
         markReady();
     }
     function cleanupComponent(component) {
@@ -1339,6 +1479,8 @@
             }
             resetChannelScopedState(component);
             maybeAutoCaptureShift(component, true);
+            maybePrefetchShiftBase(component);
+            pruneStaleFullscreenHost();
             maintainStreamFreshness(component);
             syncLoadingState(component);
         }, 500);
@@ -1394,12 +1536,204 @@
             return Promise.reject(e);
         }
     }
+    function exitCaller() {
+        try {
+            const lines = String(new Error().stack || '').split('\n');
+            return (lines[2] || lines[1] || '?').trim().replace(/^at\s+/, '').slice(0, 140);
+        } catch (e) {
+            return '?';
+        }
+    }
+    function installExitFullscreenGuard() {
+        if (exitFullscreenGuardInstalled) {
+            return;
+        }
+        exitFullscreenGuardInstalled = true;
+        ['exitFullscreen', 'webkitExitFullscreen', 'webkitCancelFullScreen',
+         'mozCancelFullScreen', 'msExitFullscreen'].forEach(name => {
+            const original = document[name];
+            if (typeof original !== 'function') {
+                return;
+            }
+            const wrapper = function() {
+                if (rebuildFullscreenGuard > 0) {
+                    if (fsTrace) {
+                        fsTrace.blocked += 1;
+                    }
+                    dlog('[dev] 站点重建播放器 → 已拦下 document.' + name + '()，保持全屏');
+                    return Promise.resolve();
+                }
+                if (wantFullscreen && getBrowserFullscreenElement()) {
+                    throttleLog('exitfs-caller', 1000, () => {
+                        dlog('[dev] ⚠ 页面脚本主动调用 document.' + name + '()（非用户操作），来源=' + exitCaller());
+                    });
+                }
+                return original.apply(this, arguments);
+            };
+            wrapper.__smgOriginal = original;
+            document[name] = wrapper;
+        });
+        dlog('[dev] 全屏守卫已就位 v' +
+             ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '?') +
+             '（重建窗口内拦下站点退全屏）');
+    }
+    function adoptNativeFullscreen(component) {
+        const player = component?.player;
+        const el = getBrowserFullscreenElement();
+        if (!player || !el) {
+            return;
+        }
+        if (player.root && player.root !== el) {
+            return;
+        }
+        try {
+            player.fullscreen = true;
+            player._fullscreenEl = el;
+            if (typeof player.onFullscreenChange === 'function') {
+                player.onFullscreenChange();
+            }
+        } catch (e) {
+            return;
+        }
+        throttleLog('fs-adopt', 1500, () => {
+            dlog('[dev] 重建后仍在全屏 → 已把全屏状态同步给新播放器实例 ' + describeEl(el));
+        });
+    }
+    function describeEl(el) {
+        if (!el) return 'null';
+        const cls = String(el.className || '').split(/\s+/).filter(Boolean).slice(0, 3).join('.');
+        return '<' + String(el.tagName || '?').toLowerCase() + (cls ? '.' + cls : '') + '>';
+    }
+    function getStableFullscreenHost(component) {
+        const ref = component?.$refs?.livePlayer;
+        if (ref && ref.isConnected) {
+            return ref;
+        }
+        const el = document.querySelector(FULLSCREEN_HOST_SELECTOR);
+        if (el && el.isConnected) {
+            const root = component?.player?.root;
+            if (!root || el.contains(root) || !root.isConnected) {
+                return el;
+            }
+        }
+        return null;
+    }
     function getFullscreenTarget(component, button) {
-        return component?.player?.root ||
+        return getStableFullscreenHost(component) ||
+            component?.player?.root ||
             button?.closest?.('.xgplayer') ||
-            component?.$refs?.livePlayer?.querySelector?.('.xgplayer') ||
             component?.$refs?.livePlayer ||
             document.querySelector('.live-player .xgplayer, .player-box .xgplayer, .xgplayer, .live-player, .player-box');
+    }
+    function markFullscreenHost(component, target) {
+        const host = getStableFullscreenHost(component);
+        if (!host || host !== target) {
+            dlog('[dev] 全屏布局未挂容器：目标不是稳定容器 target=' + describeEl(target) +
+                 ' host=' + describeEl(host));
+            return;
+        }
+        host.classList.add(FULLSCREEN_TARGET_CLASS);
+        nativeFullscreenHost = host;
+        nativeFullscreenHostAt = Date.now();
+        dlog('[dev] 全屏布局已挂稳定容器 ' + describeEl(host) +
+             ' 含player.root=' + !!(host.querySelector && host.querySelector('.xgplayer')));
+    }
+    function clearFullscreenHost() {
+        if (nativeFullscreenHost) {
+            nativeFullscreenHost.classList.remove(FULLSCREEN_TARGET_CLASS);
+            nativeFullscreenHost = null;
+        }
+        nativeFullscreenHostAt = 0;
+    }
+    function pruneStaleFullscreenHost() {
+        if (!nativeFullscreenHost || Date.now() - nativeFullscreenHostAt < 1500) {
+            return false;
+        }
+        if (getBrowserFullscreenElement() || isFallbackFullscreen()) {
+            return false;
+        }
+        dlog('[dev] 全屏布局类残留（当前并未全屏）→ 清理 ' + describeEl(nativeFullscreenHost));
+        clearFullscreenHost();
+        return true;
+    }
+    function nudgePlayerResize(component) {
+        const player = component?.player;
+        if (!player || typeof player.resize !== 'function') {
+            return false;
+        }
+        try {
+            player.resize();
+        } catch (e) {
+            return false;
+        }
+        throttleLog('fs-resize', 1500, () => {
+            dlog('[dev] 容器全屏中重建 → 已催 xgplayer 重算尺寸');
+        });
+        return true;
+    }
+    function isIOSVideoFullscreen(component) {
+        const video = getPlayerVideo(component);
+        return !!(video && (video.webkitDisplayingFullscreen || video.webkitFullscreenElement));
+    }
+    let fsTrace = null;
+    function fsStateLabel() {
+        const el = getBrowserFullscreenElement();
+        if (el) {
+            return '真全屏(' + describeEl(el) + ')';
+        }
+        return isFallbackFullscreen() ? '网页全屏' : '非全屏';
+    }
+    function startFsTrace(tag) {
+        if (fsTrace && Date.now() - fsTrace.t0 < 5000) {
+            fsTrace.steps.push(tag);
+            return;
+        }
+        fsTrace = { t0: Date.now(), steps: [tag], start: fsStateLabel(), blocked: 0, checks: [] };
+    }
+    function noteFsTrace(text) {
+        if (fsTrace && fsTrace.checks.length < 6 && fsTrace.checks[fsTrace.checks.length - 1] !== text) {
+            fsTrace.checks.push(text);
+        }
+    }
+    function endFsTrace() {
+        if (!fsTrace || Date.now() - fsTrace.t0 < 1000) {
+            return;
+        }
+        const t = fsTrace;
+        fsTrace = null;
+        const end = fsStateLabel();
+        if (t.blocked === 0 && t.start === '非全屏' && end === '非全屏') {
+            return;
+        }
+        dlog('[dev] ★全屏轨迹 ' + t.steps.join('→') +
+             ' | 起=' + t.start +
+             ' 拦下退出=' + t.blocked +
+             (t.checks.length ? ' 检查=' + t.checks.join(',') : '') +
+             ' 末=' + end +
+             ' 意图=' + wantFullscreen +
+             ' 用时=' + Math.round(Date.now() - t.t0) + 'ms');
+    }
+    function restoreFullscreenIfNeeded(component, tag) {
+        if (!wantFullscreen) {
+            noteFsTrace('无全屏意图');
+            return;
+        }
+        if (getBrowserFullscreenElement() || isFallbackFullscreen() || isIOSVideoFullscreen(component)) {
+            adoptNativeFullscreen(component);
+            nudgePlayerResize(component);
+            noteFsTrace('仍在');
+            dlog('[dev] 重建后检查(' + tag + ')：仍在全屏（已同步给新实例）');
+            return;
+        }
+        if (fsRestoreTries >= 2) {
+            noteFsTrace('丢失·放弃');
+            dlog('[dev] 重建后检查(' + tag + ')：已尝试 ' + fsRestoreTries + ' 次仍未恢复，放弃（需手动再点全屏）');
+            return;
+        }
+        fsRestoreTries += 1;
+        noteFsTrace('丢失·恢复' + fsRestoreTries);
+        dlog('[dev] 重建后检查(' + tag + ')：全屏已丢失 → 尝试恢复 第' + fsRestoreTries + '次');
+        enterFullscreen(component, getFullscreenTarget(component, null), 'restore');
     }
     function syncFullscreenButtonState(component, isFullscreen) {
         document.querySelectorAll(FULLSCREEN_BUTTON_SELECTOR).forEach(button => {
@@ -1471,23 +1805,46 @@
             return false;
         }
     }
-    function enterFullscreen(component, target) {
+    function enterFullscreen(component, target, from) {
         const player = component?.player;
+        const usePlayerApi = !!(player && typeof player.getFullscreen === 'function');
+        const isHost = !!target && target === getStableFullscreenHost(component);
+        const activated = navigator.userActivation ? !!navigator.userActivation.isActive : true;
+        if (!activated && from === 'restore') {
+            dlog('[dev] 全屏请求 来源=restore 无用户手势 → 直接 CSS 兜底 目标=' + describeEl(target));
+            wantFullscreen = true;
+            enterFallbackFullscreen(target, component);
+            return;
+        }
+        dlog('[dev] 全屏请求 来源=' + (from || 'button') + ' 目标=' + describeEl(target) +
+             ' 稳定容器=' + isHost + ' 走=' + (usePlayerApi ? 'xgplayer.getFullscreen' : '原生requestFullscreen'));
         const enterNative = callFullscreenMethod(() => (
-            player && typeof player.getFullscreen === 'function' ?
-            player.getFullscreen(target) :
-            requestElementFullscreen(target)
+            usePlayerApi ? player.getFullscreen(target) : requestElementFullscreen(target)
         ));
         Promise.resolve(enterNative)
-            .then(() => syncFullscreenButtonState(component, true))
-            .catch(() => {
+            .then(() => {
+            wantFullscreen = true;
+            markFullscreenHost(component, target);
+            syncFullscreenButtonState(component, true);
+            dlog('[dev] 全屏成功 当前全屏元素=' + describeEl(getBrowserFullscreenElement()));
+        })
+            .catch(err => {
+            dlog('[dev] 原生全屏未成功：' + (err && err.message ? err.message : err));
+            wantFullscreen = true;
             if (!enterNativeVideoFullscreen(component)) {
                 enterFallbackFullscreen(target, component);
+                dlog('[dev] 全屏兜底 CSS 目标=' + describeEl(target));
+            } else {
+                dlog('[dev] 全屏兜底 iOS 视频全屏');
             }
         });
     }
     function exitFullscreen(component) {
         const player = component?.player;
+        wantFullscreen = false;
+        dlog('[dev] 退出全屏 方式=' + (isFallbackFullscreen() ? 'CSS兜底' : '原生') +
+             ' 全屏元素=' + describeEl(getBrowserFullscreenElement()));
+        clearFullscreenHost();
         if (isFallbackFullscreen()) {
             exitFallbackFullscreen(component);
             return;
@@ -1522,6 +1879,11 @@
         event.stopImmediatePropagation?.();
         const component = findTVComponent();
         const target = getFullscreenTarget(component, button);
+        const host = getStableFullscreenHost(component);
+        dlog('[dev] 点击全屏按钮 目标=' + describeEl(target) +
+             ' 稳定容器=' + describeEl(host) +
+             ' player.root=' + describeEl(component?.player?.root) +
+             ' 目标即容器=' + (!!host && target === host));
         syncLoadingState(component);
         const video = getPlayerVideo(component);
         if (getBrowserFullscreenElement() || isFallbackFullscreen()) {
@@ -1534,40 +1896,70 @@
             } catch (e) {
                 console.warn('[SMGTV] 退出 iOS 原生全屏失败', e);
             }
+            wantFullscreen = false;
             syncFullscreenButtonState(component, false);
         } else {
-            enterFullscreen(component, target);
+            fsRestoreTries = 0;
+            enterFullscreen(component, target, 'button');
         }
     }
     function handleFullscreenChange() {
-        if (getBrowserFullscreenElement()) {
+        const component = findTVComponent();
+        const el = getBrowserFullscreenElement();
+        if (el) {
             if (isFallbackFullscreen()) {
-                exitFallbackFullscreen(findTVComponent());
+                exitFallbackFullscreen(component);
             }
-            syncFullscreenButtonState(findTVComponent(), true);
-        } else if (!isFallbackFullscreen()) {
-            syncFullscreenButtonState(findTVComponent(), false);
+            syncFullscreenButtonState(component, true);
+            wantFullscreen = true;
+            dlog('[dev] 全屏变化→进入 元素=' + describeEl(el) +
+                 ' 即挂的容器=' + (el === nativeFullscreenHost));
+            return;
         }
+        if (isFallbackFullscreen()) {
+            return;
+        }
+        syncFullscreenButtonState(component, false);
+        clearFullscreenHost();
+        dlog('[dev] 全屏变化→退出 用户意图=' + wantFullscreen + ' 元素=' + describeEl(el) +
+             '（未经守卫拦截 → 按用户主动退出处理）');
+        wantFullscreen = false;
+        fsRestoreTries = 0;
     }
     function initFullscreenPatch() {
+        installExitFullscreenGuard();
         document.addEventListener('click', handleFullscreenControl, true);
         document.addEventListener('touchend', handleFullscreenControl, true);
         document.addEventListener('fullscreenchange', handleFullscreenChange);
         document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
         document.addEventListener('mozfullscreenchange', handleFullscreenChange);
         document.addEventListener('MSFullscreenChange', handleFullscreenChange);
-        document.addEventListener('keydown', event => {
-            if (event.key === 'Escape' && isFallbackFullscreen()) {
+        const onEscape = event => {
+            if (event.key !== 'Escape' && event.key !== 'Esc' && event.keyCode !== 27) {
+                return;
+            }
+            if (isFallbackFullscreen()) {
                 exitFallbackFullscreen(findTVComponent());
             }
-        });
+            if (wantFullscreen) {
+                wantFullscreen = false;
+                clearFullscreenHost();
+                noteFsTrace('Esc');
+                dlog('[dev] Esc 退出全屏 → 清除全屏意图');
+            }
+        };
+        window.addEventListener('keydown', onEscape, true);
     }
+    const REBUILD_DESTROYS_PLAYER = ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer'];
     function wrapComponentMethod(component, methodName, after) {
         const original = component?.[methodName];
         if (typeof original !== 'function' || original.__smgWrapped) {
             return;
         }
         const wrapped = function() {
+            if (methodName !== 'getProgramDetail') {
+                startFsTrace(methodName);
+            }
             if (DEV_LOG && (methodName === 'initPlayer' || methodName === 'changeProgram')) {
                 const a0 = arguments[0] || {};
                 dlog('[dev] ' + methodName + ' 进入', 'url=' + (typeof a0.url === 'string' ? (a0.url || '(空)') : '-'),
@@ -1581,12 +1973,27 @@
                 clearResumePosition(this);
             }
             ensurePlayableStream(this);
-            const result = original.apply(this, arguments);
+            if (methodName !== 'getProgramDetail') {
+                this.__smgRebuildAt = Date.now();
+                fsRestoreTries = 0;
+            }
+            const holdsFullscreen = REBUILD_DESTROYS_PLAYER.indexOf(methodName) >= 0;
+            if (holdsFullscreen) {
+                rebuildFullscreenGuard += 1;
+            }
+            let result;
+            try {
+                result = original.apply(this, arguments);
+            } finally {
+                if (holdsFullscreen) {
+                    rebuildFullscreenGuard -= 1;
+                }
+            }
             const runAfter = () => {
                 ensurePlayableStream(this);
-                setTimeout(() => after(this), 0);
-                setTimeout(() => after(this), 250);
-                setTimeout(() => after(this), 1000);
+                setTimeout(() => after(this, 0), 0);
+                setTimeout(() => after(this, 250), 250);
+                setTimeout(() => after(this, 1000), 1000);
             };
             if (result && typeof result.then === 'function') {
                 result.then(runAfter, runAfter);
@@ -1632,7 +2039,16 @@
             component._handlerUnload = null;
         }
         ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel', 'getProgramDetail'].forEach(methodName => {
-            wrapComponentMethod(component, methodName, syncLoadingState);
+            wrapComponentMethod(component, methodName, function (comp, tick) {
+                syncLoadingState(comp);
+                if (methodName !== 'getProgramDetail') {
+                    restoreFullscreenIfNeeded(comp, methodName + '+' +
+                        Math.round(Date.now() - (comp.__smgRebuildAt || Date.now())) + 'ms');
+                    if (tick === 1000) {
+                        endFsTrace();
+                    }
+                }
+            });
         });
         installReplayUrlPatch(component);
         wrapMobileInitPlayer(component);
