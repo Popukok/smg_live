@@ -13,7 +13,6 @@
 // @grant            unsafeWindow
 // @connect          kapi.kankanews.com
 // ==/UserScript==
-// ==/UserScript==
 (function() {
     'use strict';
     const UW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
