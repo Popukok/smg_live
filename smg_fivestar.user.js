@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.24
+// @version          0.25
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -41,11 +41,48 @@
     const BASE_SAFETY_MS = 5000;
     const SCAN_DAYS_PER_TRY = 2;
     const SCAN_STEP_DELAY_MS = 1200;
-    const DONOR_MEMO_TTL_MS = 30 * 60 * 1000;
+    const DONOR_MEMO_TTL_MS = 12 * 60 * 60 * 1000;
     const PREFETCH_SHIFT_DELAY_MS = 6000;
     const PREFETCH_SHIFT_RETRY_MS = 2 * 60 * 1000;
     const shiftScanCursor = Object.create(null);
     const donorMemo = Object.create(null);
+    const DONOR_LS_PREFIX = 'smgtv_donor_';
+    function loadDonorMemo() {
+        try {
+            const now = Date.now();
+            for (let i = LS.length - 1; i >= 0; i -= 1) {
+                const k = LS.key(i);
+                if (!k || k.indexOf(DONOR_LS_PREFIX) !== 0) { continue; }
+                let ok = false;
+                try {
+                    const o = JSON.parse(LS.getItem(k));
+                    if (o && o.id && o.at && now - o.at < DONOR_MEMO_TTL_MS) {
+                        donorMemo[k.slice(DONOR_LS_PREFIX.length)] = o;
+                        ok = true;
+                    }
+                } catch (e) {}
+                if (!ok) {
+                    try { LS.removeItem(k); } catch (e) {}
+                }
+            }
+        } catch (e) {}
+    }
+    function saveDonorMemo(channelId, id) {
+        donorMemo[channelId] = { id: id, at: Date.now() };
+        try {
+            LS.setItem(DONOR_LS_PREFIX + channelId, JSON.stringify(donorMemo[channelId]));
+        } catch (e) {}
+    }
+    function dropDonorMemo(channelId) {
+        delete donorMemo[channelId];
+        try { LS.removeItem(DONOR_LS_PREFIX + channelId); } catch (e) {}
+    }
+    function saveScanCursor(channelId, daysAgo) {
+        shiftScanCursor[channelId] = daysAgo;
+    }
+    function loadScanCursor(channelId) {
+        return shiftScanCursor[channelId] || 1;
+    }
     const STREAM_NO_EXP_TTL_MS = 20 * 60 * 1000;
     const STREAM_ADDRESS_TTL_MS = 30 * 60 * 1000;
     const STALL_TIMEOUT_MS = 30000;
@@ -55,7 +92,7 @@
     const RESUME_POSITION_TTL_MS = 90000;
     const AUTO_ACQUIRE_CHANNELS = ['10'];
     const SMG_API_SECRET = '28c8edde3d61a0411511d3b1866f0636';
-    const SMG_API_VERSION = '2.42.23';
+    const SMG_API_VERSION = '2.45.2';
     const SMG_PUBKEY = '-----BEGIN PUBLIC KEY-----\n' +
           'MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDP5hzPUW5RFeE2xBT1ERB3hHZI\n' +
           'Votn/qatWhgc1eZof09qKjElFN6Nma461ZAwGpX4aezKP8Adh4WJj4u2O54xCXDt\n' +
@@ -280,6 +317,43 @@
             }
         });
     }
+    const CLIENT_UUID_LEN = 21;
+    const CLIENT_UUID_ALPHABET = 'useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict';
+    function makeClientUuid() {
+        let out = '';
+        try {
+            const buf = new Uint8Array(CLIENT_UUID_LEN);
+            const c = UW.crypto || UW.msCrypto;
+            if (c && typeof c.getRandomValues === 'function') {
+                c.getRandomValues(buf);
+            } else {
+                for (let i = 0; i < CLIENT_UUID_LEN; i += 1) { buf[i] = Math.floor(Math.random() * 256); }
+            }
+            for (let i = 0; i < CLIENT_UUID_LEN; i += 1) {
+                out += CLIENT_UUID_ALPHABET[buf[i] & 63];
+            }
+        } catch (e) {
+            out = '';
+        }
+        try {
+            while (out.length < CLIENT_UUID_LEN) {
+                out += CLIENT_UUID_ALPHABET.charAt(Math.floor(Math.random() * CLIENT_UUID_ALPHABET.length));
+            }
+        } catch (e) {}
+        if (out.length < CLIENT_UUID_LEN) {
+            out = (out + '000000000000000000000').slice(0, CLIENT_UUID_LEN);
+        }
+        return out.slice(0, CLIENT_UUID_LEN);
+    }
+    function getClientUuid() {
+        let uuid = '';
+        try { uuid = LS.getItem('uuid') || ''; } catch (e) { uuid = ''; }
+        if (uuid.length !== CLIENT_UUID_LEN) {
+            uuid = makeClientUuid();
+            try { LS.setItem('uuid', uuid); } catch (e) {}
+        }
+        return uuid;
+    }
     const API_MIN_INTERVAL_MS = 800;
     let apiLastAt = 0;
     let apiQueue = Promise.resolve();
@@ -303,7 +377,7 @@
         const q = Object.keys(params || {}).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
         const headers = { Accept: 'application/json, text/plain, */*' };
         Object.keys(signed).forEach(hk => { headers[hk] = signed[hk]; });
-        headers['M-Uuid'] = LS.getItem('uuid') || '';
+        headers['M-Uuid'] = getClientUuid();
         const url = 'https://kapi.kankanews.com' + path + (q ? '?' + q : '');
         let pageFetch;
         try {
@@ -786,7 +860,7 @@
                             key: '',
                             src: 'script'
                         };
-                        donorMemo[channelId] = { id: donorId, at: Date.now() };
+                        saveDonorMemo(channelId, donorId);
                         dlog('[dev] 解密成功 路径=' + u.pathname,
                              '剩余=' + Math.round(((parseStreamExpiry(url) || 0) - Date.now()) / 1000) + 's');
                         console.log('[SMGTV] 已获取回看源');
@@ -809,20 +883,20 @@
             });
     }
     function scanPastDays(channelId) {
-        const start = shiftScanCursor[channelId] || 1;
+        const start = loadScanCursor(channelId);
         let probed = 0;
         const step = daysAgo => {
             if (daysAgo > 7) {
-                shiftScanCursor[channelId] = 1;
+                saveScanCursor(channelId, 1);
                 console.warn('[SMGTV] 7天内未找到可用的回看源');
                 return Promise.resolve(null);
             }
             return probeDonorDay(channelId, daysAgo).then(url => {
                 if (url) {
-                    shiftScanCursor[channelId] = 1;
+                    saveScanCursor(channelId, 1);
                     return url;
                 }
-                shiftScanCursor[channelId] = daysAgo + 1;
+                saveScanCursor(channelId, daysAgo + 1);
                 probed += 1;
                 if (probed >= SCAN_DAYS_PER_TRY) {
                     dlog('[dev] 本次取源已探 ' + probed + ' 天, 游标停在第 ' + (daysAgo + 1) + ' 天');
@@ -864,7 +938,7 @@
                 if (url) {
                     return url;
                 }
-                delete donorMemo[channelId];
+                dropDonorMemo(channelId);
                 return acquireFromToday(channelId, component);
             });
         }
@@ -952,16 +1026,18 @@
             crossTabRelease();
             if (ok) {
                 const pendingReplay = !!(opts.prefetch && component.programObj && component.programObj.play === 0);
+                const idle = hasNoPlayableSource(component);
                 component[cooldownKey] = 0;
                 component.__smgAcquireFails = 0;
                 component.__smgNeedShiftBase = false;
                 if (opts.prefetch) {
                     dlog('[dev] 后台预热完成 ch=' + chId +
-                         (pendingReplay ? '（用户已切回看，立即重建）' : '（不重建播放器）'));
+                         (pendingReplay ? '（用户已切回看，立即重建）'
+                             : (idle ? '（没有可播源，立即注入避免黑屏）' : '（不重建播放器）')));
                 }
                 const swapped = !!(opts.inPlace && applyStreamUrlInPlace(component, opts.reason || '续期'));
                 if (!swapped && component && typeof component.initPlayer === 'function' &&
-                        (opts.rebuild !== false || pendingReplay)) {
+                        (opts.rebuild !== false || pendingReplay || idle)) {
                     rememberPlaybackPosition(component, getPlayerVideo(component));
                     if (isMobileSite()) {
                         const prog = component.programObj;
@@ -1002,11 +1078,12 @@
         if (cached && cached.url && baseExpiryOf(cached) - BASE_SAFETY_MS > Date.now()) {
             return false;
         }
+        const idleNow = hasNoPlayableSource(component);
         if (!component.__smgWatchAt) {
             component.__smgWatchAt = Date.now();
-            return false;
+            if (!idleNow) { return false; }
         }
-        if (Date.now() - component.__smgWatchAt < PREFETCH_SHIFT_DELAY_MS) {
+        if (!idleNow && Date.now() - component.__smgWatchAt < PREFETCH_SHIFT_DELAY_MS) {
             return false;
         }
         if (component.__smgAcquiring ||
@@ -1015,7 +1092,7 @@
         }
         component.__smgPrefetchAt = Date.now();
         component.__smgWatchAt = Date.now();
-        dlog('[dev] 后台预热回看基底 ch=' + chId);
+        dlog('[dev] 后台预热回看基底 ch=' + chId + (idleNow ? '（没有可播源，不等待）' : ''));
         component.__smgNeedShiftBase = true;
         return maybeAutoCaptureShift(component, true, { force: true, rebuild: false, prefetch: true });
     }
@@ -1398,6 +1475,15 @@
             video.readyState >= 2 ||
             (!video.paused && video.currentTime > 0)
         );
+    }
+    function hasNoPlayableSource(component) {
+        const player = component && component.player;
+        if (!player) { return true; }
+        const cfg = player.config;
+        if (cfg && typeof cfg.url === 'string') { return !cfg.url; }
+        const video = getPlayerVideo(component);
+        if (!video) { return true; }
+        return !!video.error;
     }
     function setVideoReadyClass(isReady) {
         const target = document.body || document.documentElement;
@@ -2307,6 +2393,7 @@ if (typeof originalFetch === 'function') {
     };
 }
 ensureViewportFitCover();
+loadDonorMemo();
 initComponentPatch();
 initFullscreenPatch();
 })();
