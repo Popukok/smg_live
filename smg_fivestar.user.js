@@ -13,10 +13,15 @@
 // @grant            unsafeWindow
 // @connect          kapi.kankanews.com
 // ==/UserScript==
+// ==/UserScript==
 (function() {
     'use strict';
     const UW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const LS = (() => { try { return UW.localStorage || localStorage; } catch (e) { return localStorage; } })();
+    // Internal API reads must retain the server's original capability flags.
+    const RAW_FETCH = typeof UW.fetch === 'function' ? UW.fetch.bind(UW) : null;
+    const originalProgramFlags = new WeakMap();
+    const originalProgramFlagsById = new Map();
     const DEV_LOG = false;
     function dlog() {
         if (!DEV_LOG) { return; }
@@ -390,7 +395,7 @@
                     try { controller.abort(); } catch (e) {}
                 }, 12000);
             }
-            pageFetch = Promise.resolve(UW.fetch(url, opts)).finally(() => {
+            pageFetch = Promise.resolve(RAW_FETCH(url, opts)).finally(() => {
                 if (timer) clearTimeout(timer);
             });
         } catch (e) {
@@ -531,9 +536,29 @@
     function getResultChannelId(result) {
         return result?.channel_id || result?.channel_info?.id || result?.id;
     }
+    function rememberServerProgramFlags(program) {
+        if (!program || program.id == null || program.is_review == null) return;
+        const flags = { is_review: program.is_review };
+        originalProgramFlags.set(program, flags);
+        originalProgramFlagsById.set(String(program.id), flags);
+        if (originalProgramFlagsById.size > 5000) {
+            originalProgramFlagsById.delete(originalProgramFlagsById.keys().next().value);
+        }
+    }
+    function serverAllowsReview(program) {
+        const flags = program && originalProgramFlags.get(program);
+        return !!program && Number(flags ? flags.is_review : program.is_review) === 1;
+    }
     function forceOpenProgram(program) {
         if (!program) {
             return;
+        }
+        if (!originalProgramFlags.has(program)) {
+            const flags = originalProgramFlagsById.get(String(program.id)) || { is_review: program.is_review };
+            originalProgramFlags.set(program, flags);
+            if (program.id != null && program.is_review != null && !originalProgramFlagsById.has(String(program.id))) {
+                originalProgramFlagsById.set(String(program.id), flags);
+            }
         }
         program.is_shield = 0;
         program.can_review = 1;
@@ -588,6 +613,17 @@
             }
         }
         fillStreamAddresses(channelInfo, channelId);
+    }
+    function withTimeWindow(url, program) {
+        try {
+            const u = new URL(url);
+            u.searchParams.set('start', program.start_time);
+            u.searchParams.set('end', program.end_time);
+            return u.toString();
+        } catch (e) {
+            return url + (url.includes('?') ? '&' : '?') +
+                'start=' + program.start_time + '&end=' + program.end_time;
+        }
     }
     function stripTimeWindow(url) {
         try {
@@ -709,7 +745,12 @@
              'play=' + (program ? program.play : '-'),
              'prog=' + (program && program.name ? String(program.name).slice(0, 12) : '-'));
         if (isReplay && hasWindow) {
-            dlog('[dev] 页面自带 start/end，不改写');
+            if (preferBase && program?.start_time && program?.end_time) {
+                config.url = withTimeWindow(baseOk, program);
+                component.__smgPreferFreshBaseUntil = 0;
+            } else if (urlStale) {
+                component.__smgNeedShiftBase = true;
+            }
             return;
         }
         if (isReplay && hasStream && !hasWindow && program?.start_time && program?.end_time) {
@@ -720,12 +761,11 @@
             if (preferBase) {
                 component.__smgPreferFreshBaseUntil = 0;
             }
-            config.url = useUrl + (useUrl.includes('?') ? '&' : '?') +
-                'start=' + program.start_time + '&end=' + program.end_time;
+            config.url = withTimeWindow(useUrl, program);
         } else if (isReplay && !hasStream && program?.start_time && program?.end_time) {
             if (baseOk) {
                 component.__smgPreferFreshBaseUntil = 0;
-                config.url = baseOk + '&start=' + program.start_time + '&end=' + program.end_time;
+                config.url = withTimeWindow(baseOk, program);
                 if (!isProbe) {
                     console.log('[SMGTV] 已注入回放 频道' + channelId);
                 }
@@ -790,8 +830,7 @@
                 if ((!current || currentStale) && canInject) {
                     const base = baseEntry.url;
                     if (isReplay) {
-                        opts.url = base + (base.includes('?') ? '&' : '?') +
-                            'start=' + program.start_time + '&end=' + program.end_time;
+                        opts.url = withTimeWindow(base, program);
                     } else {
                         opts.url = base;
                     }
@@ -808,12 +847,13 @@
         component.initPlayer = wrapped;
     }
     function dateStrOffset(daysAgo) {
-        const d = new Date(Date.now() - daysAgo * 86400000);
-        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        // EPG dates follow China time even when the viewer is abroad.
+        return new Date(Date.now() + 8 * 3600000 - daysAgo * 86400000)
+            .toISOString().slice(0, 10);
     }
     function findTodayDonorId(component) {
         const lists = [component?.currentProgramList, component?.playingProgramList];
-        const isEnded = p => p && p.id && p.isOutDate === 0 && p.play === 0;
+        const isEnded = p => p && p.id && p.isOutDate === 0 && p.play === 0 && serverAllowsReview(p);
         for (const list of lists) {
             if (!Array.isArray(list)) continue;
             for (const p of list) {
@@ -823,17 +863,17 @@
         for (const list of lists) {
             if (!Array.isArray(list)) continue;
             for (const p of list) {
-                if (isEnded(p) && p.is_review === 1) return p.id;
+                if (isEnded(p)) return p.id;
             }
         }
         return null;
     }
     function findDonorIdFromList(list) {
         if (!Array.isArray(list)) return null;
-        const news = list.find(p => p && p.is_review === 1 && p.id &&
+        const news = list.find(p => p && serverAllowsReview(p) && p.id &&
                                typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1);
         if (news) return news.id;
-        const any = list.find(p => p && p.is_review === 1 && p.id);
+        const any = list.find(p => p && serverAllowsReview(p) && p.id);
         return any ? any.id : null;
     }
     function fetchShiftByDonor(channelId, donorId) {
@@ -1022,8 +1062,10 @@
             console.warn('[SMGTV] 取源异常：', err && err.message ? err.message : err);
             return null;
         }).then(ok => {
-            component.__smgAcquiring = false;
             crossTabRelease();
+            if (String(getCompChannelId(component)) !== String(chId)) return;
+            component.__smgAcquiring = false;
+            if (playbackKey(component) !== pbKey) return;
             if (ok) {
                 const pendingReplay = !!(opts.prefetch && component.programObj && component.programObj.play === 0);
                 const idle = hasNoPlayableSource(component);
@@ -1096,6 +1138,51 @@
         component.__smgNeedShiftBase = true;
         return maybeAutoCaptureShift(component, true, { force: true, rebuild: false, prefetch: true });
     }
+    function rebuildCurrentPlayer(component) {
+        if (!component.programObj?.id && typeof component.initNoProgramPlayer === 'function') {
+            component.initNoProgramPlayer();
+        } else if (isMobileSite()) {
+            component.initPlayer({ url: '', isLive: component.programObj?.play === 1, autoplay: true });
+        } else {
+            component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
+        }
+    }
+    function refreshOfficialStream(component, reason) {
+        const key = playbackKey(component);
+        const programId = component.programObj?.id;
+        const chId = getCompChannelId(component);
+        if (!programId || chId == null || component.__smgRefreshingDetails) return false;
+        if (Date.now() - (component.__smgDetailRefreshAt || 0) < STREAM_RENEW_COOLDOWN_MS) return false;
+        component.__smgDetailRefreshAt = Date.now();
+        component.__smgRefreshingDetails = true;
+        smgApiGet('/content/pc/tv/program/detail', { channel_program_id: programId })
+            .then(res => new Promise(resolve => {
+                const detail = res && String(res.code) === '1000' && res.result;
+                const replay = component.programObj?.play === 0;
+                const enc = detail?.channel_info?.[replay ? 'shift_address' : 'live_address'];
+                if (!enc || playbackKey(component) !== key ||
+                        String(getResultChannelId(detail)) !== String(chId)) return resolve(null);
+                decryptRsaChunks(enc, url => resolve(url ? { detail, url, replay } : null));
+            }))
+            .then(result => {
+                if (!result || playbackKey(component) !== key) return;
+                const exp = parseStreamExpiry(result.url);
+                if (exp != null && exp - BASE_SAFETY_MS <= Date.now()) return;
+                const cache = result.replay ? channelShiftBaseCache : channelLiveBaseCache;
+                cache[chId] = { url: stripTimeWindow(result.url), at: Date.now(), exp,
+                    key: result.replay ? '' : key, src: 'script' };
+                component.programDetail = result.detail;
+                ensurePlayableStream(component);
+                component.__smgPreferFreshBaseUntil = Date.now() + 30000;
+                if (!applyStreamUrlInPlace(component, reason)) {
+                    rememberPlaybackPosition(component, getPlayerVideo(component));
+                    rebuildCurrentPlayer(component);
+                }
+            })
+            .catch(err => console.warn('[SMGTV] 刷新节目地址失败', err && err.message))
+            .finally(() => { component.__smgRefreshingDetails = false; });
+        return true;
+    }
     function applyStreamUrlInPlace(component, reason) {
         const player = component && component.player;
         if (!player || typeof player.switchURL !== 'function') {
@@ -1114,6 +1201,7 @@
         const isReplay = component.programObj?.play === 0;
         const video = getPlayerVideo(component);
         const wasPaused = !!(video && video.paused);
+        const key = playbackKey(component);
         try {
             const ret = player.switchURL(url, isReplay ? undefined : { startTime: 0 });
             console.log('[SMGTV] 播放源续期（' + reason + '）已就地换源，不重建播放器');
@@ -1126,6 +1214,10 @@
                     }
                 }).catch(err => {
                     console.warn('[SMGTV] 就地换源未完成：', err && err.message ? err.message : err);
+                    if (component.player === player && playbackKey(component) === key) {
+                        rememberPlaybackPosition(component, getPlayerVideo(component));
+                        rebuildCurrentPlayer(component);
+                    }
                 });
             }
             return true;
@@ -1142,6 +1234,9 @@
         throttleLog('renew-log', 30000, () => {
             console.log('[SMGTV] 播放源失效（' + reason + '），正在重新获取 频道' + chId);
         });
+        if (!canAutoAcquire(chId)) {
+            return refreshOfficialStream(component, reason);
+        }
         component.__smgNeedShiftBase = true;
         if (rebuild || inPlace) {
             component.__smgPreferFreshBaseUntil = Date.now() + 30000;
@@ -1153,15 +1248,19 @@
         if (!video) {
             return null;
         }
-        if (video.paused || video.ended || video.seeking) {
-            component.__smgStallWatch = null;
-            clearStuckStart(component);
-            return null;
-        }
         const err = video.error;
         if (err && err.code !== 1) {
             component.__smgStallWatch = null;
             return '媒体错误 code=' + err.code;
+        }
+        if (!video.ended && component.player?.root?.classList?.contains('xgplayer-is-error')) {
+            component.__smgStallWatch = null;
+            return '播放器报告加载错误';
+        }
+        if (video.paused || video.ended || video.seeking) {
+            component.__smgStallWatch = null;
+            clearStuckStart(component);
+            return null;
         }
         const now = Date.now();
         if (video.currentTime < 1) {
@@ -1285,7 +1384,7 @@
         rememberPlaybackPosition(component, video);
         ensurePlayableStream(component);
         if (!forceRenewStream(component, reason, true)) {
-            component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
+            rebuildCurrentPlayer(component);
         }
     }
     function resetChannelScopedState(component) {
@@ -2289,6 +2388,7 @@ function rewriteTvApiResponse(requestUrl, response) {
         );
     }
     if (requestUrl.includes('/program/detail') && response.result) {
+        rememberServerProgramFlags(response.result);
         forceOpenProgram(response.result);
         const channelInfo = response.result.channel_info || (response.result.channel_info = {});
         forceOpenProgram(channelInfo);
@@ -2298,6 +2398,7 @@ function rewriteTvApiResponse(requestUrl, response) {
     }
     if (requestUrl.includes('/programs') && response.result?.programs) {
         response.result.programs.forEach(program => {
+            rememberServerProgramFlags(program);
             forceOpenProgram(program);
             modified = true;
         });
@@ -2356,7 +2457,7 @@ UW.XMLHttpRequest.prototype.open = function(method, url) {
     }
     return originalOpen.apply(this, arguments);
 };
-const originalFetch = UW.fetch;
+const originalFetch = RAW_FETCH;
 if (typeof originalFetch === 'function') {
     UW.fetch = function(input, init) {
         const requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
