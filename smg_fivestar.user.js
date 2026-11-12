@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.25
+// @version          0.26
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -17,7 +17,6 @@
     'use strict';
     const UW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const LS = (() => { try { return UW.localStorage || localStorage; } catch (e) { return localStorage; } })();
-    // Internal API reads must retain the server's original capability flags.
     const RAW_FETCH = typeof UW.fetch === 'function' ? UW.fetch.bind(UW) : null;
     const originalProgramFlags = new WeakMap();
     const originalProgramFlagsById = new Map();
@@ -42,7 +41,18 @@
     const channelLiveBaseCache = Object.create(null);
     const STREAM_RENEW_MARGIN_MS = 120000;
     const STREAM_RENEW_COOLDOWN_MS = 60000;
+    const SEAMLESS_FALLBACK_MS = 8000;
     const BASE_SAFETY_MS = 5000;
+    const UPDATE_CHECK_URL = 'https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js';
+    const UPDATE_INSTALL_URL = UPDATE_CHECK_URL;
+    const UPDATE_CHECK_INTERVAL_MS = 6 * 3600000;
+    const UPDATE_LS_CHECKED = 'smgtv_update_checked_at';
+    const UPDATE_LS_LATEST = 'smgtv_update_latest';
+    const UPDATE_LS_DISMISSED = 'smgtv_update_dismissed';
+    const UPDATE_STYLE_ID = 'smgtv-update-style';
+    const UPDATE_TAG_ID = 'smgtv-update-tag';
+    const UPDATE_BADGE_ID = 'smgtv-update-badge';
+    const UPDATE_COLLAPSE_MS = 3000;
     const SCAN_DAYS_PER_TRY = 2;
     const SCAN_STEP_DELAY_MS = 1200;
     const DONOR_MEMO_TTL_MS = 12 * 60 * 60 * 1000;
@@ -96,7 +106,8 @@
     const RESUME_POSITION_TTL_MS = 90000;
     const AUTO_ACQUIRE_CHANNELS = ['10'];
     const SMG_API_SECRET = '28c8edde3d61a0411511d3b1866f0636';
-    const SMG_API_VERSION = '2.45.2';
+    const SMG_API_VERSION_FALLBACK = '2.45.2';
+    let SMG_API_VERSION = SMG_API_VERSION_FALLBACK;
     const SMG_PUBKEY = '-----BEGIN PUBLIC KEY-----\n' +
           'MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDP5hzPUW5RFeE2xBT1ERB3hHZI\n' +
           'Votn/qatWhgc1eZof09qKjElFN6Nma461ZAwGpX4aezKP8Adh4WJj4u2O54xCXDt\n' +
@@ -268,6 +279,36 @@
             a = add(a, oa); b = add(b, ob); c = add(c, oc); d = add(d, od);
         }
         return binl2hex([a, b, c, d]);
+    }
+    const SITE_APP_VERSION_RE = /\/app\.v(\d+\.\d+\.\d+)\.js/;
+    function readSiteVersionFromDom() {
+        try {
+            const scripts = document.querySelectorAll('script[src]');
+            for (let i = 0; i < scripts.length; i += 1) {
+                const m = SITE_APP_VERSION_RE.exec(scripts[i].getAttribute('src') || '');
+                if (m && m[1]) {
+                    SMG_API_VERSION = m[1];
+                    dlog('[dev] 站点版本已同步 version=' + m[1]);
+                    return true;
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+    function syncSiteApiVersion() {
+        if (readSiteVersionFromDom()) return;
+        try {
+            const observer = new MutationObserver(() => {
+                if (readSiteVersionFromDom()) {
+                    observer.disconnect();
+                }
+            });
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+            setTimeout(() => observer.disconnect(), 15000);
+            document.addEventListener('DOMContentLoaded', () => {
+                if (readSiteVersionFromDom()) observer.disconnect();
+            }, { once: true });
+        } catch (e) {}
     }
     function smgSignParams(params) {
         const n = {
@@ -537,6 +578,12 @@
     }
     function rememberServerProgramFlags(program) {
         if (!program || program.id == null || program.is_review == null) return;
+        if (originalProgramFlags.has(program)) return;
+        const byId = originalProgramFlagsById.get(String(program.id));
+        if (byId) {
+            originalProgramFlags.set(program, byId);
+            return;
+        }
         const flags = { is_review: program.is_review };
         originalProgramFlags.set(program, flags);
         originalProgramFlagsById.set(String(program.id), flags);
@@ -845,9 +892,9 @@
         wrapped.__smgMobileWrapped = true;
         component.initPlayer = wrapped;
     }
+    const SITE_TZ_OFFSET_HOURS = 8;
     function dateStrOffset(daysAgo) {
-        // EPG dates follow China time even when the viewer is abroad.
-        return new Date(Date.now() + 8 * 3600000 - daysAgo * 86400000)
+        return new Date(Date.now() + SITE_TZ_OFFSET_HOURS * 3600000 - daysAgo * 86400000)
             .toISOString().slice(0, 10);
     }
     function findTodayDonorId(component) {
@@ -1062,8 +1109,8 @@
             return null;
         }).then(ok => {
             crossTabRelease();
-            if (String(getCompChannelId(component)) !== String(chId)) return;
             component.__smgAcquiring = false;
+            if (String(getCompChannelId(component)) !== String(chId)) return;
             if (playbackKey(component) !== pbKey) return;
             if (ok) {
                 const pendingReplay = !!(opts.prefetch && component.programObj && component.programObj.play === 0);
@@ -1201,11 +1248,21 @@
         const video = getPlayerVideo(component);
         const wasPaused = !!(video && video.paused);
         const key = playbackKey(component);
+        const supportsSeamless = /seamless/.test(String(player.switchURL));
+        const useSeamless = !isReplay && supportsSeamless;
+        const switchOpts = useSeamless ? { seamless: true, startTime: 0 }
+            : (isReplay ? undefined : { startTime: 0 });
         try {
-            const ret = player.switchURL(url, isReplay ? undefined : { startTime: 0 });
-            console.log('[SMGTV] 播放源续期（' + reason + '）已就地换源，不重建播放器');
-            dlog('[dev] 就地换源 模式=' + (isReplay ? '回看(按进度续播)' : '直播(回直播边缘)'),
+            const ret = player.switchURL(url, switchOpts);
+            console.log('[SMGTV] 播放源续期（' + reason + '）已就地换源，不重建播放器' +
+                        (useSeamless ? '（seamless 无缝）' : ''));
+            dlog('[dev] 就地换源 模式=' + (isReplay ? '回看(按进度续播)' :
+                 (useSeamless ? '直播(seamless 续播)' : '直播(回直播边缘)')),
+                 'supportsSeamless=' + supportsSeamless,
                  'url=' + String(url).slice(0, 90));
+            if (useSeamless) {
+                armSeamlessFallback(component, player, key, video);
+            }
             if (ret && typeof ret.then === 'function') {
                 ret.then(() => {
                     if (wasPaused) {
@@ -1224,6 +1281,22 @@
             dlog('[dev] 就地换源抛错：' + (e && e.message) + ' → 回退重建');
             return false;
         }
+    }
+    function armSeamlessFallback(component, player, key, video) {
+        clearTimeout(component.__smgSeamlessTimer);
+        const startPos = video ? video.currentTime : 0;
+        component.__smgSeamlessTimer = setTimeout(() => {
+            component.__smgSeamlessTimer = 0;
+            if (component.player !== player || playbackKey(component) !== key) return;
+            const nowVideo = getPlayerVideo(component);
+            const advanced = nowVideo && nowVideo.currentTime > startPos + 0.25;
+            const playable = nowVideo && !nowVideo.paused && nowVideo.readyState >= 2;
+            if (advanced && playable) return;
+            console.warn('[SMGTV] seamless 换源 ' + SEAMLESS_FALLBACK_MS / 1000 +
+                         's 内未起播，回退重建');
+            rememberPlaybackPosition(component, nowVideo);
+            rebuildCurrentPlayer(component);
+        }, SEAMLESS_FALLBACK_MS);
     }
     function forceRenewStream(component, reason, rebuild, inPlace) {
         const chId = getCompChannelId(component);
@@ -1463,6 +1536,230 @@
         }
         forceRenewStream(component, '地址临近到期', canRebuild, true);
     }
+    function getScriptVersion() {
+        try {
+            if (typeof GM_info === 'undefined') return '';
+            const v = GM_info && GM_info.script && GM_info.script.version;
+            return typeof v === 'string' ? v.trim() : '';
+        } catch (e) {
+            return '';
+        }
+    }
+    function compareVersions(a, b) {
+        const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
+        const pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
+        const len = Math.max(pa.length, pb.length);
+        for (let i = 0; i < len; i += 1) {
+            const x = pa[i] || 0;
+            const y = pb[i] || 0;
+            if (x !== y) return x > y ? 1 : -1;
+        }
+        return 0;
+    }
+    function parseRemoteVersion(text) {
+        const m = /^\s*\/\/\s*@version\s+(\S+)\s*$/m.exec(String(text || ''));
+        return m ? m[1] : '';
+    }
+    function lsGet(key) {
+        try { return LS.getItem(key); } catch (e) { return null; }
+    }
+    function lsSet(key, value) {
+        try { LS.setItem(key, value); } catch (e) {}
+    }
+    function todayStamp() {
+        const d = new Date();
+        return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+    }
+    function showUpdateTag(latest) {
+        if (document.getElementById(UPDATE_TAG_ID) || document.getElementById(UPDATE_BADGE_ID)) return;
+        if (lsGet(UPDATE_LS_DISMISSED) === todayStamp()) return;
+        injectUpdateStyle();
+        const tag = document.createElement('div');
+        tag.id = UPDATE_TAG_ID;
+        tag.setAttribute('role', 'status');
+        const body = document.createElement('div');
+        body.className = 'smgtv-update-body';
+        const text = document.createElement('span');
+        text.className = 'smgtv-update-text';
+        text.textContent = '脚本有新版本 ' + latest + '，请及时更新';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = '立即更新';
+        btn.addEventListener('click', () => {
+            try { UW.open(UPDATE_INSTALL_URL, '_blank'); } catch (e) {}
+        });
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'smgtv-update-close';
+        close.setAttribute('aria-label', '关闭');
+        close.textContent = '×';
+        close.addEventListener('click', () => {
+            lsSet(UPDATE_LS_DISMISSED, todayStamp());
+            clearTimeout(tag.__smgCollapseTimer);
+            badge.remove();
+            tag.remove();
+        });
+        body.appendChild(text);
+        body.appendChild(btn);
+        body.appendChild(close);
+        tag.appendChild(body);
+        const badge = document.createElement('div');
+        badge.id = UPDATE_BADGE_ID;
+        badge.className = 'smgtv-update-badge';
+        badge.textContent = '新';
+        badge.setAttribute('title', '有脚本新版本，点击展开');
+        badge.addEventListener('click', () => expandUpdateTag(tag));
+        badge.addEventListener('mouseenter', () => expandUpdateTag(tag));
+        badge.addEventListener('mouseleave', () => scheduleUpdateCollapse(tag));
+        (document.body || document.documentElement).appendChild(tag);
+        (document.body || document.documentElement).appendChild(badge);
+        tag.__smgBadge = badge;
+        tag.addEventListener('mouseenter', () => expandUpdateTag(tag));
+        tag.addEventListener('mouseleave', () => scheduleUpdateCollapse(tag));
+        tag.classList.add('smgtv-update-entering');
+        try {
+            void tag.offsetWidth;
+            requestAnimationFrame(() => tag.classList.remove('smgtv-update-entering'));
+        } catch (e) {
+            tag.classList.remove('smgtv-update-entering');
+        }
+        scheduleUpdateCollapse(tag);
+        dlog('[dev] 更新提示已弹出 latest=' + latest);
+    }
+    function updateTagNodes(tag) {
+        return [tag, tag && tag.__smgBadge].filter(Boolean);
+    }
+    function expandUpdateTag(tag) {
+        if (!tag || !tag.isConnected) return;
+        clearTimeout(tag.__smgCollapseTimer);
+        tag.__smgCollapseTimer = 0;
+        updateTagNodes(tag).forEach(n => n.classList.remove('smgtv-update-collapsed'));
+    }
+    function scheduleUpdateCollapse(tag) {
+        if (!tag || !tag.isConnected) return;
+        clearTimeout(tag.__smgCollapseTimer);
+        tag.__smgCollapseTimer = setTimeout(() => {
+            if (!tag.isConnected || tag.matches(':hover')) return;
+            const badge = tag.__smgBadge;
+            if (badge && badge.matches(':hover')) return;
+            updateTagNodes(tag).forEach(n => n.classList.add('smgtv-update-collapsed'));
+        }, UPDATE_COLLAPSE_MS);
+    }
+    function injectUpdateStyle() {
+        if (document.getElementById(UPDATE_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = UPDATE_STYLE_ID;
+        style.textContent = [
+            '#' + UPDATE_TAG_ID + '{position:fixed;right:16px;bottom:16px;z-index:2147483646;',
+            'display:flex;align-items:center;gap:10px;max-width:calc(100vw - 32px);',
+            'padding:10px 12px;border-radius:8px;background:#1f2329;color:#fff;',
+            'font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
+            'box-shadow:0 4px 16px rgba(0,0,0,.35);',
+            'transform-origin:right bottom;will-change:transform,opacity;',
+            'transition:transform .3s cubic-bezier(.18,.89,.32,1.28),',
+            'opacity .3s ease-out;}',
+            '#' + UPDATE_TAG_ID + ':not(.smgtv-update-collapsed){',
+            'transition:transform .34s cubic-bezier(.18,.89,.32,1.28),',
+            'opacity .24s ease-out;}',
+            '#' + UPDATE_TAG_ID + ' .smgtv-update-text{white-space:nowrap;}',
+            '#' + UPDATE_TAG_ID + ' button{flex:none;border:0;border-radius:5px;cursor:pointer;',
+            'font:inherit;padding:5px 10px;background:#3b82f6;color:#fff;',
+            'transition:background-color .15s ease,transform .2s ease;}',
+            '#' + UPDATE_TAG_ID + ' button:hover{background:#2563eb;}',
+            '#' + UPDATE_TAG_ID + ' button:active{transform:scale(.94);}',
+            '#' + UPDATE_TAG_ID + ' .smgtv-update-close{padding:2px 7px;background:transparent;',
+            'color:#c9ced6;font-size:18px;line-height:1;}',
+            '#' + UPDATE_TAG_ID + ' .smgtv-update-close:hover{background:rgba(255,255,255,.12);',
+            'color:#fff;}',
+            '#' + UPDATE_TAG_ID + ' .smgtv-update-body{display:flex;align-items:center;gap:10px;',
+            'transition:opacity .2s ease-out,transform .3s cubic-bezier(.18,.89,.32,1.28);}',
+            '#' + UPDATE_BADGE_ID + '{position:fixed;right:16px;bottom:16px;',
+            'z-index:2147483646;width:40px;height:40px;',
+            'border-radius:50%;background:#3b82f6;color:#fff;',
+            'display:flex;align-items:center;justify-content:center;cursor:pointer;',
+            'font:600 15px/1 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
+            'box-shadow:0 3px 12px rgba(0,0,0,.3);user-select:none;',
+            'transform-origin:right bottom;will-change:transform,opacity;',
+            'opacity:0;transform:scale(0);pointer-events:none;',
+            'transition:transform .3s cubic-bezier(.18,.89,.32,1.28),',
+            'opacity .3s ease-out;}',
+            '#' + UPDATE_TAG_ID + '.smgtv-update-entering{opacity:0;',
+            'transform:translateX(40px) scale(.88);',
+            'transition:none;}',
+            '#' + UPDATE_TAG_ID + '.smgtv-update-collapsed{transform:scale(0);',
+            'opacity:0;pointer-events:none;}',
+            '#' + UPDATE_BADGE_ID + '.smgtv-update-collapsed{opacity:1;',
+            'transform:scale(1);pointer-events:auto;}',
+            '@media (prefers-reduced-motion:reduce){#' + UPDATE_TAG_ID + ',',
+            '#' + UPDATE_TAG_ID + ' .smgtv-update-body,',
+            '#' + UPDATE_BADGE_ID + ',#' + UPDATE_TAG_ID + ' button{transition:none;}}',
+            '@media (prefers-color-scheme:light){#' + UPDATE_TAG_ID + '{background:#fff;',
+            'color:#1f2329;border:1px solid #e3e6eb;box-shadow:0 4px 16px rgba(0,0,0,.12);}',
+            '#' + UPDATE_TAG_ID + ' .smgtv-update-close{color:#6b7280;}}'
+        ].join('');
+        (document.head || document.documentElement).appendChild(style);
+    }
+    function checkScriptUpdate() {
+        const current = getScriptVersion();
+        if (!current) return;
+        if (typeof GM_info !== 'undefined' && GM_info.script) {
+            const updateUrl = GM_info.scriptUpdateURL ||
+                (GM_info.script && GM_info.script.updateURL);
+            if (!updateUrl) return;
+        }
+        const latest = lsGet(UPDATE_LS_LATEST);
+        if (latest && compareVersions(latest, current) > 0) {
+            try {
+                showUpdateTag(latest);
+            } catch (e) {
+                console.warn('[SMGTV] 更新提示创建失败:', e && e.message);
+            }
+            return;
+        }
+        const last = parseInt(lsGet(UPDATE_LS_CHECKED) || '0', 10) || 0;
+        if (Date.now() - last < UPDATE_CHECK_INTERVAL_MS) return;
+        const fetcher = RAW_FETCH || (typeof fetch === 'function' ? fetch.bind(window) : null);
+        if (!fetcher) return;
+        let done = false;
+        const finish = text => {
+            if (done) return;
+            done = true;
+            const remote = parseRemoteVersion(text);
+            if (!remote) {
+                throttleLog('update-parse-fail', 60000, () => {
+                    console.warn('[SMGTV] 更新检查：远端脚本未解析出版本号');
+                });
+                return;
+            }
+            lsSet(UPDATE_LS_CHECKED, String(Date.now()));
+            lsSet(UPDATE_LS_LATEST, remote);
+            if (compareVersions(remote, current) > 0) {
+                try {
+                    showUpdateTag(remote);
+                } catch (e) {
+                    console.warn('[SMGTV] 更新提示创建失败:', e && e.message);
+                }
+            }
+        };
+        try {
+            Promise.resolve(fetcher(UPDATE_CHECK_URL, {
+                method: 'GET',
+                credentials: 'omit'
+            })).then(resp => {
+                if (!resp || typeof resp.text !== 'function') return '';
+                return resp.text();
+            }).then(finish).catch(() => {
+                lsSet(UPDATE_LS_CHECKED, String(Date.now() - UPDATE_CHECK_INTERVAL_MS + 1800000));
+                throttleLog('update-check-fail', 60000, () => {
+                    console.warn('[SMGTV] 更新检查失败（网络不可用或跨域被拦），30 分钟后重试');
+                });
+            });
+        } catch (e) {
+            throttleLog('update-check-error', 60000, () => {
+                console.warn('[SMGTV] 更新检查异常：', e && e.message);
+            });
+        }
+    }
     function injectStyle(cssText) {
         const appendStyle = () => {
             if (document.getElementById(STYLE_ID)) {
@@ -1535,6 +1832,30 @@
             }
         }
         return null;
+    }
+    function dlogComponentDiag() {
+        if (!DEV_LOG) { return; }
+        try {
+            const selectors = ['.huikan', '.live-container', '.live-box', '.live-player', '.tv', '.player-box'];
+            const found = selectors.map(s => {
+                const el = document.querySelector(s);
+                if (!el) return s + '=无';
+                const inst = getVueInstance(el);
+                return s + '=有' + (inst ? '(vue:是' + (isTVComponent(inst) ? ',判据命中' : ',判据未命中') + ')' : '(vue:否)');
+            });
+            const appEl = document.querySelector('#app') || document.querySelector('[data-v-app]');
+            const anyVue = document.querySelector('[data-v-app]') ||
+                (appEl && (getVueInstance(appEl) || appEl.__vue__));
+            const videos = document.querySelectorAll('video').length;
+            dlog('[dev] 组件自检（10s 未命中，疑似站点结构变化）',
+                 '候选=' + found.join(' '),
+                 '页面存在Vue痕迹=' + !!anyVue,
+                 'video元素数=' + videos,
+                 'readyState=' + document.readyState,
+                 'url=' + location.href);
+        } catch (e) {
+            dlog('[dev] 组件自检异常：' + (e && e.message));
+        }
     }
     let urlExpProbe = { url: '', exp: null, iat: null };
     function probePlayerUrl(component) {
@@ -1641,6 +1962,10 @@
         if (component.__smgLoadingMonitor) {
             clearInterval(component.__smgLoadingMonitor);
             component.__smgLoadingMonitor = null;
+        }
+        if (component.__smgSeamlessTimer) {
+            clearTimeout(component.__smgSeamlessTimer);
+            component.__smgSeamlessTimer = 0;
         }
         if (component.__smgLoadingObserver) {
             component.__smgLoadingObserver.disconnect();
@@ -2279,6 +2604,7 @@
                 clearInterval(timer);
                 scanning = false;
                 console.warn('[SMGTV] 未找到播放器组件实例');
+                dlogComponentDiag();
             }
         }, 200);
     }
@@ -2390,7 +2716,6 @@ function rewriteTvApiResponse(requestUrl, response) {
         rememberServerProgramFlags(response.result);
         forceOpenProgram(response.result);
         const channelInfo = response.result.channel_info || (response.result.channel_info = {});
-        forceOpenProgram(channelInfo);
         const channelId = getResultChannelId(response.result);
         fillStreamAddresses(channelInfo, channelId);
         modified = true;
@@ -2493,7 +2818,13 @@ if (typeof originalFetch === 'function') {
     };
 }
 ensureViewportFitCover();
+syncSiteApiVersion();
 loadDonorMemo();
 initComponentPatch();
 initFullscreenPatch();
+if (document.body) {
+    checkScriptUpdate();
+} else {
+    document.addEventListener('DOMContentLoaded', checkScriptUpdate, { once: true });
+}
 })();
