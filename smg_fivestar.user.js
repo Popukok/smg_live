@@ -1,213 +1,293 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.26
-// @description      收看SMGTV，并解除页面部分限制
-// @author           https://github.com/Popukok
-// @match            *://*.kankanews.com/huikan*
+// @version          0.36
+// @description      打开网页即可收看SMGTV，并解除试看倒计时与切页暂停等限制（Safari/Stay 兼容 + 多路径 Vue 探测 + 回放功能 + 进度条拖动 + token自举）
+// @match            https://live.kankanews.com/*
+// @match            https://m.kankanews.com/*
+// @match            http://live.kankanews.com/*
+// @match            http://m.kankanews.com/*
 // @icon             https://live.kankanews.com/favicon.ico
-// @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
-// @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
-// @run-at           document-start
-// @grant            GM_xmlhttpRequest
-// @grant            unsafeWindow
-// @connect          kapi.kankanews.com
+// @grant            none
+// @run-at           document-body
+// @compatible       safari
+// @compatible       stay
 // ==/UserScript==
+
 (function() {
-    'use strict';
-    const UW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-    const LS = (() => { try { return UW.localStorage || localStorage; } catch (e) { return localStorage; } })();
-    const RAW_FETCH = typeof UW.fetch === 'function' ? UW.fetch.bind(UW) : null;
-    const originalProgramFlags = new WeakMap();
-    const originalProgramFlagsById = new Map();
-    const DEV_LOG = false;
-    function dlog() {
-        if (!DEV_LOG) { return; }
-        try {
-            console.log.apply(console, ['[SMGTV]'].concat(Array.prototype.slice.call(arguments)));
-        } catch (e) {}
+    "use strict";
+
+    console.log("[SMGTV] ========== v0.33 ==========");
+    console.log("[SMGTV] URL:", location.href);
+
+    // ===== 0. Mobile handling =====
+    // The server detects mobile UA and redirects live.kankanews.com → m.kankanews.com,
+    // but corrupts the URL: /huikan?id=10 → /huikan/10 (404).
+    // We can't redirect back without causing an infinite loop (server → m → live → server → ...).
+    // Solution: use history.replaceState to fix the URL in-place, then continue.
+    if (location.hostname === "m.kankanews.com") {
+        // Fix /huikan/10 → /huikan?id=10 in-place (no page reload)
+        var m = location.pathname.match(/^\/huikan\/(\d+)$/);
+        if (m) {
+            var fixed = "/huikan?id=" + m[1];
+            history.replaceState(null, "", fixed);
+            console.log("[SMGTV] Fixed broken mobile URL in-place:", fixed);
+        }
     }
-    const STYLE_ID = 'smgtv-unlock-style';
-    const VIDEO_READY_CLASS = 'smgtv-video-ready';
-    const FULLSCREEN_FALLBACK_CLASS = 'smgtv-fallback-fullscreen';
-    const FULLSCREEN_TARGET_CLASS = 'smgtv-fallback-fullscreen-target';
-    const FULLSCREEN_BUTTON_SELECTOR = '.xgplayer-fullscreen';
-    const FULLSCREEN_HOST_SELECTOR = '.live-player, .player-box';
-    const VIDEO_READY_EVENTS = ['loadeddata', 'canplay', 'playing', 'timeupdate', 'progress'];
-    const VIDEO_RESET_EVENTS = ['loadstart', 'waiting', 'stalled', 'emptied'];
-    const watchedVideos = new WeakSet();
-    const streamAddressCache = Object.create(null);
-    const channelShiftBaseCache = Object.create(null);
-    const channelLiveBaseCache = Object.create(null);
-    const STREAM_RENEW_MARGIN_MS = 120000;
-    const STREAM_RENEW_COOLDOWN_MS = 60000;
-    const SEAMLESS_FALLBACK_MS = 8000;
-    const BASE_SAFETY_MS = 5000;
-    const UPDATE_CHECK_URL = 'https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js';
-    const UPDATE_INSTALL_URL = UPDATE_CHECK_URL;
-    const UPDATE_CHECK_INTERVAL_MS = 6 * 3600000;
-    const UPDATE_LS_CHECKED = 'smgtv_update_checked_at';
-    const UPDATE_LS_LATEST = 'smgtv_update_latest';
-    const UPDATE_LS_DISMISSED = 'smgtv_update_dismissed';
-    const UPDATE_STYLE_ID = 'smgtv-update-style';
-    const UPDATE_TAG_ID = 'smgtv-update-tag';
-    const UPDATE_BADGE_ID = 'smgtv-update-badge';
-    const UPDATE_COLLAPSE_MS = 3000;
-    const SCAN_DAYS_PER_TRY = 2;
-    const SCAN_STEP_DELAY_MS = 1200;
-    const DONOR_MEMO_TTL_MS = 12 * 60 * 60 * 1000;
-    const PREFETCH_SHIFT_DELAY_MS = 6000;
-    const PREFETCH_SHIFT_RETRY_MS = 2 * 60 * 1000;
-    const shiftScanCursor = Object.create(null);
-    const donorMemo = Object.create(null);
-    const DONOR_LS_PREFIX = 'smgtv_donor_';
-    function loadDonorMemo() {
+    console.log("[SMGTV] UA:", navigator.userAgent);
+
+    // ===== 1. CSS: hide copyright mask =====
+    var style = document.createElement("style");
+    style.textContent = ".image-mask{display:none!important}.video-tip{display:none!important}";
+    (document.head || document.documentElement).appendChild(style);
+    console.log("[SMGTV] CSS injected");
+
+    // ===== 2. Patch webpack module 560 (E.a URL decryption bypass) =====
+    // Module 560 exports E.a which RSA-decrypts live_address strings.
+    // Our plain shift URLs pass through E.a and get corrupted to empty string.
+    // Fix: monkey-patch E.a to passthrough plain HTTP URLs.
+    var _module560Patched = false;
+    function patchModule560() {
+        if (_module560Patched) return;
         try {
-            const now = Date.now();
-            for (let i = LS.length - 1; i >= 0; i -= 1) {
-                const k = LS.key(i);
-                if (!k || k.indexOf(DONOR_LS_PREFIX) !== 0) { continue; }
-                let ok = false;
+            // Capture __webpack_require__ via a injected chunk
+            window.webpackJsonp.push([[], {
+                '__smg_m560_probe': function(module, exports, __webpack_require__) {
+                    try {
+                        var mod560 = __webpack_require__(560);
+                        if (mod560 && typeof mod560.a === 'function') {
+                            var origEa = mod560.a;
+                            mod560.a = function(t) {
+                                // If input is a plain URL (starts with http), return as-is
+                                if (typeof t === 'string' && t.indexOf('http') === 0) {
+                                    console.log("[SMGTV] [Replay] E.a bypass — plain URL passthrough:", t.substring(0, 80));
+                                    return t;
+                                }
+                                // Otherwise, RSA-decrypt as normal
+                                return origEa.apply(this, arguments);
+                            };
+                            _module560Patched = true;
+                            console.log("[SMGTV] Module 560 (E.a) patched successfully");
+                        }
+                    } catch(e) {
+                        console.warn("[SMGTV] Module 560 patch failed:", e.message);
+                    }
+                }
+            }, ['__smg_m560_probe']]);
+        } catch(e) {
+            console.warn("[SMGTV] webpack chunk push failed:", e.message);
+        }
+    }
+    patchModule560();
+
+    // ===== 3. Intercept API responses =====
+
+    // v0.21: marker header identifying the script's own API requests, so the
+    // interceptors below skip them (breaks the self-trigger feedback loop:
+    // donor bootstrap requests -> re-patch -> initPlayer -> bootstrap ...).
+    var SMG_OWN_REQ = "X-SMG-Own";
+    function smgIsOwnRequest(urlStr, init) {
+        if (urlStr.indexOf("smgown=1") !== -1) return true;
+        try {
+            var h = (init && init.headers) || {};
+            if (h[SMG_OWN_REQ]) return true;
+        } catch (e) {}
+        return false;
+    }
+
+    // --- XHR: re-patch Vue after API responses (can't reliably modify XHR response in-flight) ---
+    var origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        var urlStr = String(url);
+        if (urlStr.indexOf("/content/pc/tv/") !== -1) {
+            var xhr = this;
+            xhr.addEventListener("readystatechange", function() {
+                if (xhr.readyState === 4 && xhr.status === 200) {
+                    // v0.21: if a player is already running, don't rebuild it —
+                    // the page fires program/detail on every program switch.
+                    // v0.22-fix: but STILL re-apply the playable fields to the
+                    // freshly loaded program list, otherwise changeProgram()
+                    // early-returns on can_review=0 and the click does nothing.
+                    try {
+                        var v = findVue();
+                        if (v && v.player && v.player.config && v.player.config.url) {
+                            smgFixProgramFields(v);
+                            setTimeout(function() {
+                                try { smgFixProgramFields(findVue()); } catch (e) {}
+                            }, 80);
+                            return;
+                        }
+                    } catch (e) {}
+                    console.log("[SMGTV] XHR response received for:", urlStr.substring(0, 80));
+                    // For program detail responses, re-patch with a slight delay
+                    // so shift_address gets injected before initPlayer reads it
+                    setTimeout(tryPatch, 30);
+                }
+            });
+        }
+        return origOpen.apply(this, arguments);
+    };
+
+    // --- fetch: re-patch Vue after API responses ---
+    var origFetch = window.fetch;
+    window.fetch = function(input, init) {
+        var urlStr = typeof input === "string" ? input : (input && input.url) || "";
+        if (urlStr.indexOf("/content/pc/tv/") !== -1 && !smgIsOwnRequest(urlStr, init)) {
+            return origFetch.apply(this, arguments).then(function(resp) {
+                // v0.21: same player-exists guard as XHR above.
+                // v0.22-fix: still re-apply playable fields to the new list.
                 try {
-                    const o = JSON.parse(LS.getItem(k));
-                    if (o && o.id && o.at && now - o.at < DONOR_MEMO_TTL_MS) {
-                        donorMemo[k.slice(DONOR_LS_PREFIX.length)] = o;
-                        ok = true;
+                    var v = findVue();
+                    if (v && v.player && v.player.config && v.player.config.url) {
+                        smgFixProgramFields(v);
+                        setTimeout(function() {
+                            try { smgFixProgramFields(findVue()); } catch (e) {}
+                        }, 80);
+                        return resp;
                     }
                 } catch (e) {}
-                if (!ok) {
-                    try { LS.removeItem(k); } catch (e) {}
-                }
-            }
-        } catch (e) {}
-    }
-    function saveDonorMemo(channelId, id) {
-        donorMemo[channelId] = { id: id, at: Date.now() };
-        try {
-            LS.setItem(DONOR_LS_PREFIX + channelId, JSON.stringify(donorMemo[channelId]));
-        } catch (e) {}
-    }
-    function dropDonorMemo(channelId) {
-        delete donorMemo[channelId];
-        try { LS.removeItem(DONOR_LS_PREFIX + channelId); } catch (e) {}
-    }
-    function saveScanCursor(channelId, daysAgo) {
-        shiftScanCursor[channelId] = daysAgo;
-    }
-    function loadScanCursor(channelId) {
-        return shiftScanCursor[channelId] || 1;
-    }
-    const STREAM_NO_EXP_TTL_MS = 20 * 60 * 1000;
-    const STREAM_ADDRESS_TTL_MS = 30 * 60 * 1000;
-    const STALL_TIMEOUT_MS = 30000;
-    const STUCK_START_TIMEOUT_MS = 60000;
-    const RECOVER_COOLDOWN_MS = 15000;
-    const RECOVER_MAX_COOLDOWN_MS = 5 * 60 * 1000;
-    const RESUME_POSITION_TTL_MS = 90000;
-    const AUTO_ACQUIRE_CHANNELS = ['10'];
-    const SMG_API_SECRET = '28c8edde3d61a0411511d3b1866f0636';
-    const SMG_API_VERSION_FALLBACK = '2.45.2';
-    let SMG_API_VERSION = SMG_API_VERSION_FALLBACK;
-    const SMG_PUBKEY = '-----BEGIN PUBLIC KEY-----\n' +
-          'MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDP5hzPUW5RFeE2xBT1ERB3hHZI\n' +
-          'Votn/qatWhgc1eZof09qKjElFN6Nma461ZAwGpX4aezKP8Adh4WJj4u2O54xCXDt\n' +
-          'wzKRqZO2oNZkuNmF2Va8kLgiEQAAcxYc8JgTN+uQQNpsep4n/o1sArTJooZIF17E\n' +
-          'tSqSgXDcJ7yDj5rc7wIDAQAB\n' +
-          '-----END PUBLIC KEY-----';
-    function parseJwtValueExp(token) {
-        try {
-            if (!token || token.split('.').length !== 3) return null;
-            const payload = token.split('.')[1];
-            if (!payload) return null;
-            const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-            const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
-            const json = JSON.parse(atob(padded));
-            if (typeof json.exp !== 'number' || !(json.exp > 0)) return null;
-            return json.exp * 1000;
-        } catch (e) {
-            return null;
+                console.log("[SMGTV] fetch response received, re-patching Vue...");
+                setTimeout(tryPatch, 50);
+                return resp;
+            });
         }
-    }
-    function parseJwtExp(url) {
-        try {
-            return parseJwtValueExp(new URL(url).searchParams.get('token'));
-        } catch (e) {
-            return null;
+        return origFetch.apply(this, arguments);
+    };
+
+    console.log("[SMGTV] API interceptors ready");
+
+    // ===== 4. Patch Vue component =====
+
+    // Helper: traverse Vue 2 $children tree to find component by name
+    function findComponent(root, name) {
+        if (!root) return null;
+        if (root.$options && root.$options.name === name) return root;
+        for (var i = 0; root.$children && i < root.$children.length; i++) {
+            var found = findComponent(root.$children[i], name);
+            if (found) return found;
         }
-    }
-    function toEpochMs(value) {
-        const n = Number(value);
-        if (!isFinite(n) || n <= 0) return null;
-        if (n >= 1e12) return n;
-        if (n >= 1e8) return n * 1000;
         return null;
     }
-    const STREAM_EXP_KEYS = ['volctime', 'volc_time', 'expire', 'expires', 'expiretime',
-                             'expire_time', 'expiredtime', 'wstime', 'ws_time', 'exper'];
-    function parseUrlTimeExpiry(url) {
-        const now = Date.now();
-        let min = null;
-        try {
-            new URL(url).searchParams.forEach((value, key) => {
-                const k = key.toLowerCase();
-                if (STREAM_EXP_KEYS.indexOf(k) === -1 && !/(expire|expiry|deadline)/.test(k)) return;
-                const t = toEpochMs(value);
-                if (t == null || t < now - 86400000 || t > now + 60 * 86400000) return;
-                if (min == null || t < min) min = t;
-            });
-        } catch (e) {}
-        return min;
-    }
-    function parseUrlJwtExp(url) {
-        const now = Date.now();
-        let min = null;
-        try {
-            new URL(url).searchParams.forEach(value => {
-                if (value.split('.').length !== 3) return;
-                const t = parseJwtValueExp(value);
-                if (t == null || t < now - 86400000 || t > now + 60 * 86400000) return;
-                if (min == null || t < min) min = t;
-            });
-        } catch (e) {}
-        return min;
-    }
-    function parseStreamExpiry(url) {
-        if (!url || typeof url !== 'string') return null;
-        const candidates = [parseJwtExp(url), parseUrlJwtExp(url), parseUrlTimeExpiry(url)]
-            .filter(t => t != null);
-        if (!candidates.length) return null;
-        return Math.min.apply(null, candidates);
-    }
-    function parseJwtValueIat(token) {
-        try {
-            if (!token || token.split('.').length !== 3) return null;
-            const payload = token.split('.')[1];
-            if (!payload) return null;
-            const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-            const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
-            const json = JSON.parse(atob(padded));
-            if (typeof json.iat !== 'number' || !(json.iat > 0)) return null;
-            return json.iat * 1000;
-        } catch (e) {
-            return null;
+
+    // Helper: find HuikanIndex via multiple paths (Safari/Stay compatibility)
+    function findVue() {
+        // Path 1: Direct access via .huikan element (Tampermonkey standard)
+        var el = document.querySelector(".huikan");
+        if (el && el.__vue__ && typeof el.__vue__.initPlayer === "function") {
+            console.log("[SMGTV] Vue found via .huikan.__vue__");
+            return el.__vue__;
         }
-    }
-    function parseStreamIssuedAt(url) {
-        if (!url || typeof url !== 'string') return null;
-        let token = null;
-        try {
-            const u = new URL(url);
-            token = u.searchParams.get('token');
-            if (!token) {
-                u.searchParams.forEach(value => {
-                    if (!token && value.split('.').length === 3) token = value;
-                });
+
+        // Path 2: From #__nuxt root, traverse $children (works in CDP/Puppeteer/Stay)
+        var root = document.querySelector("#__nuxt");
+        if (root && root.__vue__) {
+            var comp = findComponent(root.__vue__, "HuikanIndex");
+            if (comp && typeof comp.initPlayer === "function") {
+                console.log("[SMGTV] Vue found via #__nuxt traversal");
+                return comp;
             }
-        } catch (e) {
-            return null;
         }
-        return parseJwtValueIat(token);
+
+        // Path 3: Walk all elements looking for __vue__ with initPlayer (brute force)
+        var all = document.querySelectorAll("[class*=huikan], [id*=huikan], .live-player, .video-wrap");
+        for (var i = 0; i < all.length; i++) {
+            var v = all[i].__vue__;
+            if (v && typeof v.initPlayer === "function") {
+                console.log("[SMGTV] Vue found via element scan");
+                return v;
+            }
+        }
+
+        // Path 4: Check all top-level __vue__ instances on any element
+        var any = document.querySelectorAll("*");
+        for (var j = 0; j < any.length && j < 500; j++) {
+            var vw = any[j].__vue__;
+            if (vw && vw.$options && vw.$options.name === "HuikanIndex") {
+                console.log("[SMGTV] Vue found via global element scan");
+                return vw;
+            }
+        }
+
+        return null;
     }
+
+    // v0.22-fix: re-apply the playable fields on a Vue component and its program
+    // lists. MUST run on every /content/pc/tv/ response — the page rebuilds
+    // currentProgramList from the API (is_shield=1, is_review=0, can_review=0),
+    // and its own changeProgram() starts with:
+    //     if (0 !== t.can_review || 1 === t.play) {...} else return;
+    // so an unfixed list item silently does nothing when clicked. The v0.21
+    // player-exists guard skipped this entirely, which broke replay from the list.
+    function smgFixProgramFields(vue) {
+        if (!vue) return vue;
+        function fixObj(o) {
+            if (!o) return;
+            o.is_shield = 0;
+            o.is_review = 1;
+            o.can_review = 1;
+        }
+        try {
+            fixObj(vue.programObj);
+            fixObj(vue.programDetail);
+            fixObj(vue.playingProgramObj);
+            if (Array.isArray(vue.programList)) vue.programList.forEach(fixObj);
+            if (Array.isArray(vue.currentProgramList)) vue.currentProgramList.forEach(fixObj);
+            if (Array.isArray(vue.playingProgramList)) vue.playingProgramList.forEach(fixObj);
+            if (vue.currChannelDetail) vue.currChannelDetail.copyright_image = "";
+            if (vue.currChannel) vue.currChannel.copyright_image = "";
+        } catch (e) {}
+        return vue;
+    }
+
+    // ===== 4b. Token bootstrap (v0.18) =====
+    // 2026-09: server emptied live_address for ch10, so there is no live player
+    // URL to steal a token from. But the CDN does NOT verify whether a program
+    // is copyrighted — any valid token works with &startTime= for any timestamp.
+    // So we fetch program/detail for a program that still carries a
+    // shift_address (daily sports news, is_review=1), RSA-decrypt it with the
+    // page's own public key (same algorithm as webpack module 560/E.a), and use
+    // the resulting token for all shift URLs. Token is cached (~12h validity).
+    var SMG_PUBKEY = "-----BEGIN PUBLIC KEY-----\n" +
+        "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDP5hzPUW5RFeE2xBT1ERB3hHZI\n" +
+        "Votn/qatWhgc1eZof09qKjElFN6Nma461ZAwGpX4aezKP8Adh4WJj4u2O54xCXDt\n" +
+        "wzKRqZO2oNZkuNmF2Va8kLgiEQAAcxYc8JgTN+uQQNpsep4n/o1sArTJooZIF17E\n" +
+        "tSqSgXDcJ7yDj5rc7wIDAQAB\n" +
+        "-----END PUBLIC KEY-----";
+    var SMG_API_SECRET = "28c8edde3d61a0411511d3b1866f0636";
+    // v0.25: page bundle upgraded to v2.45.2 (2026-10). Tokens minted with the
+    // old version header are rejected by the CDN (403 even when fresh), so the
+    // signature version must track the page.
+    var SMG_API_VERSION = "2.45.2";
+    // v0.34: the old hard-coded donors (2026-09) no longer carry addresses.
+    // Verified 2026-11-09 02:50 from ch10 "体育新闻" (is_review=1) which still
+    // returns a 856-char shift_address -> RSA-decrypt -> token for stream wxty.
+    var SMG_DONOR_SCAN_DAYS = 7;
+    // v0.36 ROOT CAUSE (user report 2026-11-17: "所有界面都是五星"):
+    // a donor token is bound to ONE channel's stream, so a single global token
+    // cannot serve the whole site. v0.35 only pinned a stream for ch10 and still
+    // hijacked every other channel with it.
+    // Verified 2026-11-17 by decrypting each channel's latest reviewable program
+    // and fetching the resulting bare playlist:
+    //   1 东方卫视  -> dfws4k  (volc-stream) 200
+    //   2 新闻综合  -> xwzh    (volc-stream) 200
+    //   10 五星体育 -> wxty    (volc-stream) 200
+    // Only these three are taken over. Everything else keeps the site's player:
+    // 4 = another CDN (ws-channels-vods), 5/9 = the site still ships live_address,
+    // 9's donor mints a tencent-vods timeshift URL (different builder), 11/12 have
+    // no reviewable program at all.
+    var SMG_CHANNEL_MAP = {
+        "1": { stream: "dfws4k", donors: [2245248] },
+        "2": { stream: "xwzh", donors: [2245098] },
+        "10": {
+            stream: "wxty",
+            donors: [2244791, 2240773, 2240384, 2239980, 2215494, 2215102, 2213967]
+        }
+    };
+    var _smgTokenCache = null;
+    // Which channel the cached token belongs to. A token minted for 五星体育 is
+    // useless (403) on 东方卫视, so the cache is invalidated on channel change.
+    var _smgTokenChannel = "";
+
     function smgMd5(str) {
         function rl(n, c) { return (n << c) | (n >>> (32 - c)); }
         function add(x, y) {
@@ -244,2587 +324,1446 @@
         var a = 1732584193, b = -271733879, c = -1732584194, d = 271733878;
         for (var i = 0; i < x.length; i += 16) {
             var oa = a, ob = b, oc = c, od = d;
-            a = ff(a, b, c, d, x[i], 7, -680876936); d = ff(d, a, b, c, x[i + 1], 12, -389564586);
-            c = ff(c, d, a, b, x[i + 2], 17, 606105819); b = ff(b, c, d, a, x[i + 3], 22, -1044525330);
-            a = ff(a, b, c, d, x[i + 4], 7, -176418897); d = ff(d, a, b, c, x[i + 5], 12, 1200080426);
-            c = ff(c, d, a, b, x[i + 6], 17, -1473231341); b = ff(b, c, d, a, x[i + 7], 22, -45705983);
-            a = ff(a, b, c, d, x[i + 8], 7, 1770035416); d = ff(d, a, b, c, x[i + 9], 12, -1958414417);
-            c = ff(c, d, a, b, x[i + 10], 17, -42063); b = ff(b, c, d, a, x[i + 11], 22, -1990404162);
-            a = ff(a, b, c, d, x[i + 12], 7, 1804603682); d = ff(d, a, b, c, x[i + 13], 12, -40341101);
-            c = ff(c, d, a, b, x[i + 14], 17, -1502002290); b = ff(b, c, d, a, x[i + 15], 22, 1236535329);
-            a = gg(a, b, c, d, x[i + 1], 5, -165796510); d = gg(d, a, b, c, x[i + 6], 9, -1069501632);
-            c = gg(c, d, a, b, x[i + 11], 14, 643717713); b = gg(b, c, d, a, x[i], 20, -373897302);
-            a = gg(a, b, c, d, x[i + 5], 5, -701558691); d = gg(d, a, b, c, x[i + 10], 9, 38016083);
-            c = gg(c, d, a, b, x[i + 15], 14, -660478335); b = gg(b, c, d, a, x[i + 4], 20, -405537848);
-            a = gg(a, b, c, d, x[i + 9], 5, 568446438); d = gg(d, a, b, c, x[i + 14], 9, -1019803690);
-            c = gg(c, d, a, b, x[i + 3], 14, -187363961); b = gg(b, c, d, a, x[i + 8], 20, 1163531501);
-            a = gg(a, b, c, d, x[i + 13], 5, -1444681467); d = gg(d, a, b, c, x[i + 2], 9, -51403784);
-            c = gg(c, d, a, b, x[i + 7], 14, 1735328473); b = gg(b, c, d, a, x[i + 12], 20, -1926607734);
-            a = hh(a, b, c, d, x[i + 5], 4, -378558); d = hh(d, a, b, c, x[i + 8], 11, -2022574463);
-            c = hh(c, d, a, b, x[i + 11], 16, 1839030562); b = hh(b, c, d, a, x[i + 14], 23, -35309556);
-            a = hh(a, b, c, d, x[i + 1], 4, -1530992060); d = hh(d, a, b, c, x[i + 4], 11, 1272893353);
-            c = hh(c, d, a, b, x[i + 7], 16, -155497632); b = hh(b, c, d, a, x[i + 10], 23, -1094730640);
-            a = hh(a, b, c, d, x[i + 13], 4, 681279174); d = hh(d, a, b, c, x[i], 11, -358537222);
-            c = hh(c, d, a, b, x[i + 3], 16, -722521979); b = hh(b, c, d, a, x[i + 6], 23, 76029189);
-            a = hh(a, b, c, d, x[i + 9], 4, -640364487); d = hh(d, a, b, c, x[i + 12], 11, -421815835);
-            c = hh(c, d, a, b, x[i + 15], 16, 530742520); b = hh(b, c, d, a, x[i + 2], 23, -995338651);
-            a = ii(a, b, c, d, x[i], 6, -198630844); d = ii(d, a, b, c, x[i + 7], 10, 1126891415);
-            c = ii(c, d, a, b, x[i + 14], 15, -1416354905); b = ii(b, c, d, a, x[i + 5], 21, -57434055);
-            a = ii(a, b, c, d, x[i + 12], 6, 1700485571); d = ii(d, a, b, c, x[i + 3], 10, -1894986606);
-            c = ii(c, d, a, b, x[i + 10], 15, -1051523); b = ii(b, c, d, a, x[i + 1], 21, -2054922799);
-            a = ii(a, b, c, d, x[i + 8], 6, 1873313359); d = ii(d, a, b, c, x[i + 15], 10, -30611744);
-            c = ii(c, d, a, b, x[i + 6], 15, -1560198380); b = ii(b, c, d, a, x[i + 13], 21, 1309151649);
-            a = ii(a, b, c, d, x[i + 4], 6, -145523070); d = ii(d, a, b, c, x[i + 11], 10, -1120210379);
-            c = ii(c, d, a, b, x[i + 2], 15, 718787259); b = ii(b, c, d, a, x[i + 9], 21, -343485551);
+            a = ff(a, b, c, d, x[i], 7, -680876936); d = ff(d, a, b, c, x[i+1], 12, -389564586);
+            c = ff(c, d, a, b, x[i+2], 17, 606105819); b = ff(b, c, d, a, x[i+3], 22, -1044525330);
+            a = ff(a, b, c, d, x[i+4], 7, -176418897); d = ff(d, a, b, c, x[i+5], 12, 1200080426);
+            c = ff(c, d, a, b, x[i+6], 17, -1473231341); b = ff(b, c, d, a, x[i+7], 22, -45705983);
+            a = ff(a, b, c, d, x[i+8], 7, 1770035416); d = ff(d, a, b, c, x[i+9], 12, -1958414417);
+            c = ff(c, d, a, b, x[i+10], 17, -42063); b = ff(b, c, d, a, x[i+11], 22, -1990404162);
+            a = ff(a, b, c, d, x[i+12], 7, 1804603682); d = ff(d, a, b, c, x[i+13], 12, -40341101);
+            c = ff(c, d, a, b, x[i+14], 17, -1502002290); b = ff(b, c, d, a, x[i+15], 22, 1236535329);
+            a = gg(a, b, c, d, x[i+1], 5, -165796510); d = gg(d, a, b, c, x[i+6], 9, -1069501632);
+            c = gg(c, d, a, b, x[i+11], 14, 643717713); b = gg(b, c, d, a, x[i], 20, -373897302);
+            a = gg(a, b, c, d, x[i+5], 5, -701558691); d = gg(d, a, b, c, x[i+10], 9, 38016083);
+            c = gg(c, d, a, b, x[i+15], 14, -660478335); b = gg(b, c, d, a, x[i+4], 20, -405537848);
+            a = gg(a, b, c, d, x[i+9], 5, 568446438); d = gg(d, a, b, c, x[i+14], 9, -1019803690);
+            c = gg(c, d, a, b, x[i+3], 14, -187363961); b = gg(b, c, d, a, x[i+8], 20, 1163531501);
+            a = gg(a, b, c, d, x[i+13], 5, -1444681467); d = gg(d, a, b, c, x[i+2], 9, -51403784);
+            c = gg(c, d, a, b, x[i+7], 14, 1735328473); b = gg(b, c, d, a, x[i+12], 20, -1926607734);
+            a = hh(a, b, c, d, x[i+5], 4, -378558); d = hh(d, a, b, c, x[i+8], 11, -2022574463);
+            c = hh(c, d, a, b, x[i+11], 16, 1839030562); b = hh(b, c, d, a, x[i+14], 23, -35309556);
+            a = hh(a, b, c, d, x[i+1], 4, -1530992060); d = hh(d, a, b, c, x[i+4], 11, 1272893353);
+            c = hh(c, d, a, b, x[i+7], 16, -155497632); b = hh(b, c, d, a, x[i+10], 23, -1094730640);
+            a = hh(a, b, c, d, x[i+13], 4, 681279174); d = hh(d, a, b, c, x[i], 11, -358537222);
+            c = hh(c, d, a, b, x[i+3], 16, -722521979); b = hh(b, c, d, a, x[i+6], 23, 76029189);
+            a = hh(a, b, c, d, x[i+9], 4, -640364487); d = hh(d, a, b, c, x[i+12], 11, -421815835);
+            c = hh(c, d, a, b, x[i+15], 16, 530742520); b = hh(b, c, d, a, x[i+2], 23, -995338651);
+            a = ii(a, b, c, d, x[i], 6, -198630844); d = ii(d, a, b, c, x[i+7], 10, 1126891415);
+            c = ii(c, d, a, b, x[i+14], 15, -1416354905); b = ii(b, c, d, a, x[i+5], 21, -57434055);
+            a = ii(a, b, c, d, x[i+12], 6, 1700485571); d = ii(d, a, b, c, x[i+3], 10, -1894986606);
+            c = ii(c, d, a, b, x[i+10], 15, -1051523); b = ii(b, c, d, a, x[i+1], 21, -2054922799);
+            a = ii(a, b, c, d, x[i+8], 6, 1873313359); d = ii(d, a, b, c, x[i+15], 10, -30611744);
+            c = ii(c, d, a, b, x[i+6], 15, -1560198380); b = ii(b, c, d, a, x[i+13], 21, 1309151649);
+            a = ii(a, b, c, d, x[i+4], 6, -145523070); d = ii(d, a, b, c, x[i+11], 10, -1120210379);
+            c = ii(c, d, a, b, x[i+2], 15, 718787259); b = ii(b, c, d, a, x[i+9], 21, -343485551);
             a = add(a, oa); b = add(b, ob); c = add(c, oc); d = add(d, od);
         }
         return binl2hex([a, b, c, d]);
     }
-    const SITE_APP_VERSION_RE = /\/app\.v(\d+\.\d+\.\d+)\.js/;
-    function readSiteVersionFromDom() {
+
+    function smgRsaDecrypt(enc) {
         try {
-            const scripts = document.querySelectorAll('script[src]');
-            for (let i = 0; i < scripts.length; i += 1) {
-                const m = SITE_APP_VERSION_RE.exec(scripts[i].getAttribute('src') || '');
-                if (m && m[1]) {
-                    SMG_API_VERSION = m[1];
-                    dlog('[dev] 站点版本已同步 version=' + m[1]);
-                    return true;
-                }
+            if (!enc || typeof enc !== "string") return "";
+            if (typeof JSEncrypt === "undefined") return "";
+            var hex = window.atob(enc).split("").map(function(ch) {
+                return ("0" + ch.charCodeAt(0).toString(16)).slice(-2);
+            }).join("").toUpperCase();
+            if (!hex) return "";
+            var crypt = new JSEncrypt();
+            crypt.setPublicKey(SMG_PUBKEY);
+            var out = "";
+            for (var pos = 0; pos < hex.length;) {
+                var chunk = hex.slice(pos, pos + 256);
+                pos += 256;
+                var bytes = (chunk.replace(/\r|\n/g, "").match(/[\da-fA-F]{2}/g) || [])
+                    .map(function(h) { return parseInt(h, 16); });
+                var b64 = window.btoa(String.fromCharCode.apply(String, bytes));
+                if (!b64) continue;
+                var m = crypt.decrypt(b64);
+                if (m) out += m;
             }
-        } catch (e) {}
-        return false;
+            return out;
+        } catch (e) {
+            console.warn("[SMGTV] smgRsaDecrypt failed:", e && e.message);
+            return "";
+        }
     }
-    function syncSiteApiVersion() {
-        if (readSiteVersionFromDom()) return;
-        try {
-            const observer = new MutationObserver(() => {
-                if (readSiteVersionFromDom()) {
-                    observer.disconnect();
-                }
-            });
-            observer.observe(document.documentElement, { childList: true, subtree: true });
-            setTimeout(() => observer.disconnect(), 15000);
-            document.addEventListener('DOMContentLoaded', () => {
-                if (readSiteVersionFromDom()) observer.disconnect();
-            }, { once: true });
-        } catch (e) {}
-    }
+
     function smgSignParams(params) {
-        const n = {
-            platform: 'pc',
+        var n = {
+            platform: "pc",
             version: SMG_API_VERSION,
             nonce: Math.random().toString(36).slice(-8),
             timestamp: Math.floor(Date.now() / 1000),
-            'Api-Version': 'v1'
+            "Api-Version": "v1"
         };
-        const merged = {};
-        Object.keys(params).forEach(k => { merged[k] = params[k]; });
-        Object.keys(n).forEach(k => { merged[k] = n[k]; });
-        let s = '';
-        Object.keys(merged).sort().forEach(k => {
-            if (merged[k] != null) s += k + '=' + merged[k] + '&';
-        });
+        var merged = {};
+        var k;
+        for (k in params) merged[k] = params[k];
+        for (k in n) merged[k] = n[k];
+        var keys = Object.keys(merged).sort();
+        var s = "";
+        for (var i = 0; i < keys.length; i++) {
+            if (merged[keys[i]] != null) s += keys[i] + "=" + merged[keys[i]] + "&";
+        }
         merged.sign = smgMd5(smgMd5(s + SMG_API_SECRET));
         return merged;
     }
-    function shortUrl(url) { return url.split('kankanews.com')[1] || ''; }
-    function gmApiGet(url, headers) {
-        let gmHeaders = headers;
-        try {
-            const ua = (UW.navigator && UW.navigator.userAgent) || navigator.userAgent;
-            if (ua) gmHeaders = Object.assign({}, headers, { 'User-Agent': ua });
-        } catch (e) {}
-        return new Promise((resolve) => {
-            try {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: url,
-                    headers: gmHeaders,
-                    timeout: 15000,
-                    onload: function(response) {
-                        try {
-                            if (response.status !== 200) {
-                                console.warn('[SMGTV] GM接口异常 status=', response.status, shortUrl(url));
-                            }
-                            resolve(JSON.parse(response.responseText));
-                        } catch (e) {
-                            console.warn('[SMGTV] GM响应解析失败 status=', response.status, shortUrl(url));
-                            resolve(null);
-                        }
-                    },
-                    onerror: function() { console.warn('[SMGTV] GM请求失败', shortUrl(url)); resolve(null); },
-                    ontimeout: function() { console.warn('[SMGTV] GM请求超时', shortUrl(url)); resolve(null); }
-                });
-            } catch (e) {
-                console.warn('[SMGTV] GM调用异常', e);
-                resolve(null);
+
+    // NOTE: sign fields MUST go in headers, NOT in the query string. The server
+    // verifies the signature but ALSO gates address fields on request shape:
+    // the same signature sent as query params returns code 4001 with empty
+    // addresses, while header form returns code 1000 with addresses.
+    function smgApiGet(path, params, retryLeft) {
+        var signed = smgSignParams(params || {});
+        var q = Object.keys(params || {}).map(function(k) {
+            return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
+        }).join("&");
+        var headers = { "Accept": "application/json, text/plain, */*" };
+        var hk;
+        for (hk in signed) headers[hk] = signed[hk];
+        headers["M-Uuid"] = localStorage.getItem("uuid") || "";
+        // v0.21: marker so our own interceptors skip these requests.
+        headers[SMG_OWN_REQ] = "1";
+        if (retryLeft === undefined) retryLeft = 1;
+        return fetch("https://kapi.kankanews.com" + path + (q ? "?" + q : ""), {
+            headers: headers
+        }).then(function(resp) { return resp.json(); }).catch(function(e) {
+            // v0.21: retry once on transport failure (CORS preflight flake /
+            // ERR_FAILED with no HTTP status). Server errors (4001/404/...) go
+            // through .then, not here, so no retry storm on bad donors.
+            if (retryLeft > 0) {
+                console.warn("[SMGTV] [API] fetch failed, retrying once:", path);
+                return smgApiGet(path, params, retryLeft - 1);
             }
+            throw e;
         });
     }
-    const CLIENT_UUID_LEN = 21;
-    const CLIENT_UUID_ALPHABET = 'useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict';
-    function makeClientUuid() {
-        let out = '';
+
+    function smgTokenFromUrl(url) {
         try {
-            const buf = new Uint8Array(CLIENT_UUID_LEN);
-            const c = UW.crypto || UW.msCrypto;
-            if (c && typeof c.getRandomValues === 'function') {
-                c.getRandomValues(buf);
-            } else {
-                for (let i = 0; i < CLIENT_UUID_LEN; i += 1) { buf[i] = Math.floor(Math.random() * 256); }
-            }
-            for (let i = 0; i < CLIENT_UUID_LEN; i += 1) {
-                out += CLIENT_UUID_ALPHABET[buf[i] & 63];
-            }
-        } catch (e) {
-            out = '';
-        }
-        try {
-            while (out.length < CLIENT_UUID_LEN) {
-                out += CLIENT_UUID_ALPHABET.charAt(Math.floor(Math.random() * CLIENT_UUID_ALPHABET.length));
-            }
-        } catch (e) {}
-        if (out.length < CLIENT_UUID_LEN) {
-            out = (out + '000000000000000000000').slice(0, CLIENT_UUID_LEN);
-        }
-        return out.slice(0, CLIENT_UUID_LEN);
-    }
-    function getClientUuid() {
-        let uuid = '';
-        try { uuid = LS.getItem('uuid') || ''; } catch (e) { uuid = ''; }
-        if (uuid.length !== CLIENT_UUID_LEN) {
-            uuid = makeClientUuid();
-            try { LS.setItem('uuid', uuid); } catch (e) {}
-        }
-        return uuid;
-    }
-    const API_MIN_INTERVAL_MS = 800;
-    let apiLastAt = 0;
-    let apiQueue = Promise.resolve();
-    function scheduleApiCall(task) {
-        const run = () => {
-            const wait = Math.max(0, API_MIN_INTERVAL_MS - (Date.now() - apiLastAt));
-            return new Promise(resolve => setTimeout(resolve, wait)).then(() => {
-                apiLastAt = Date.now();
-                return task();
-            });
-        };
-        const next = apiQueue.then(run, run);
-        apiQueue = next.then(() => {}, () => {});
-        return next;
-    }
-    function smgApiGet(path, params) {
-        return scheduleApiCall(() => apiGetNow(path, params));
-    }
-    function apiGetNow(path, params) {
-        const signed = smgSignParams(params || {});
-        const q = Object.keys(params || {}).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
-        const headers = { Accept: 'application/json, text/plain, */*' };
-        Object.keys(signed).forEach(hk => { headers[hk] = signed[hk]; });
-        headers['M-Uuid'] = getClientUuid();
-        const url = 'https://kapi.kankanews.com' + path + (q ? '?' + q : '');
-        let pageFetch;
-        try {
-            const opts = { headers: headers };
-            let timer = null;
-            if (typeof UW.AbortController === 'function') {
-                const controller = new UW.AbortController();
-                opts.signal = controller.signal;
-                timer = setTimeout(() => {
-                    try { controller.abort(); } catch (e) {}
-                }, 12000);
-            }
-            pageFetch = Promise.resolve(RAW_FETCH(url, opts)).finally(() => {
-                if (timer) clearTimeout(timer);
-            });
-        } catch (e) {
-            return gmApiGet(url, headers);
-        }
-        return pageFetch
-            .then(res => {
-                if (!res || !res.ok) {
-                    console.warn('[SMGTV] 接口异常 status=', res && res.status, shortUrl(url));
-                }
-                return res.text();
-            })
-            .then(txt => JSON.parse(txt))
-            .catch(e => {
-                console.warn('[SMGTV] 页面fetch失败, 转GM兜底:', shortUrl(url), e && e.message);
-                return gmApiGet(url, headers);
-            });
-    }
-    function hexToBase64(hexStr) {
-        try {
-            const bytes = hexStr.replace(/\s+/g, '').match(/[\da-fA-F]{2}/g) || [];
-            if (!bytes.length) return '';
-            return btoa(bytes.map(b => String.fromCharCode(parseInt(b, 16))).join(''));
-        } catch (e) {
-            return '';
-        }
-    }
-    function decryptRsaChunks(encryptedBase64, onReady) {
-        let done = false;
-        const finish = result => {
-            if (done) return;
-            done = true;
-            onReady(result);
-        };
-        const tryDecrypt = () => {
-            if (typeof UW.JSEncrypt === 'undefined') return false;
-            try {
-                const encrypt = new UW.JSEncrypt();
-                encrypt.setPublicKey(SMG_PUBKEY);
-                let hexStr;
-                try {
-                    const binary = atob(encryptedBase64);
-                    hexStr = Array.from(binary, ch => ('0' + ch.charCodeAt(0).toString(16)).slice(-2)).join('').toUpperCase();
-                } catch (e) {
-                    finish('');
-                    return true;
-                }
-                let out = '';
-                for (let i = 0; i < hexStr.length;) {
-                    const chunk = hexStr.slice(i, i + 256);
-                    i += 256;
-                    const b64 = hexToBase64(chunk);
-                    if (!b64) continue;
-                    const decrypted = encrypt.decrypt(b64);
-                    if (decrypted) out += decrypted;
-                }
-                if (out) {
-                    finish(out);
-                    return true;
-                }
-            } catch (e) {}
-            return false;
-        };
-        if (tryDecrypt()) return;
-        let tries = 0;
-        const timer = setInterval(() => {
-            tries += 1;
-            if (tryDecrypt()) {
-                clearInterval(timer);
-            } else if (tries > 50) {
-                clearInterval(timer);
-                console.warn('[SMGTV] RSA解密失败(JSEncrypt不可用或密文异常)');
-                finish('');
-            }
-        }, 200);
-    }
-    let fullscreenFallbackTarget = null;
-    let cssFullscreenFallbackPlayer = null;
-    let lastFullscreenActionAt = 0;
-    let nativeFullscreenHost = null;
-    let nativeFullscreenHostAt = 0;
-    let wantFullscreen = false;
-    let fsRestoreTries = 0;
-    let rebuildFullscreenGuard = 0;
-    let exitFullscreenGuardInstalled = false;
-    const logThrottle = Object.create(null);
-    function throttleLog(key, intervalMs, fn) {
-        const now = Date.now();
-        if ((logThrottle[key] || 0) + intervalMs > now) {
-            return;
-        }
-        logThrottle[key] = now;
-        fn();
-    }
-    const baseLogState = { key: '' };
-    function noteBaseEvent(key, log) {
-        if (key === baseLogState.key) {
-            return;
-        }
-        baseLogState.key = key;
-        if (log) {
-            log();
-        }
-    }
-    function rememberStreamAddresses(channelId, liveAddress, shiftAddress) {
-        if (channelId == null || channelId === '') {
-            return;
-        }
-        const key = String(channelId);
-        const prev = streamAddressCache[key] || { live_address: '', shift_address: '' };
-        streamAddressCache[key] = {
-            live_address: liveAddress || prev.live_address || '',
-            shift_address: shiftAddress || prev.shift_address || '',
-            at: Date.now()
-        };
-    }
-    function fillStreamAddresses(target, channelId) {
-        if (!target) {
-            return false;
-        }
-        const cached = streamAddressCache[String(channelId)];
-        if (!cached) {
-            return false;
-        }
-        if (Date.now() - (cached.at || 0) > STREAM_ADDRESS_TTL_MS) {
-            delete streamAddressCache[String(channelId)];
-            return false;
-        }
-        const channelLiveAddress = cached.live_address || cached.shift_address;
-        const channelShiftAddress = cached.shift_address || cached.live_address;
-        if (channelLiveAddress && !target.live_address) {
-            target.live_address = channelLiveAddress;
-        }
-        if (channelShiftAddress && !target.shift_address) {
-            target.shift_address = channelShiftAddress;
-        }
-    }
-    function getResultChannelId(result) {
-        return result?.channel_id || result?.channel_info?.id || result?.id;
-    }
-    function rememberServerProgramFlags(program) {
-        if (!program || program.id == null || program.is_review == null) return;
-        if (originalProgramFlags.has(program)) return;
-        const byId = originalProgramFlagsById.get(String(program.id));
-        if (byId) {
-            originalProgramFlags.set(program, byId);
-            return;
-        }
-        const flags = { is_review: program.is_review };
-        originalProgramFlags.set(program, flags);
-        originalProgramFlagsById.set(String(program.id), flags);
-        if (originalProgramFlagsById.size > 5000) {
-            originalProgramFlagsById.delete(originalProgramFlagsById.keys().next().value);
-        }
-    }
-    function serverAllowsReview(program) {
-        const flags = program && originalProgramFlags.get(program);
-        return !!program && Number(flags ? flags.is_review : program.is_review) === 1;
-    }
-    function forceOpenProgram(program) {
-        if (!program) {
-            return;
-        }
-        if (!originalProgramFlags.has(program)) {
-            const flags = originalProgramFlagsById.get(String(program.id)) || { is_review: program.is_review };
-            originalProgramFlags.set(program, flags);
-            if (program.id != null && program.is_review != null && !originalProgramFlagsById.has(String(program.id))) {
-                originalProgramFlagsById.set(String(program.id), flags);
-            }
-        }
-        program.is_shield = 0;
-        program.can_review = 1;
-        program.is_review = 1;
-    }
-    function forceOpenProgramList(component) {
-        if (!component) {
-            return;
-        }
-        ['currentProgramList', 'playingProgramList', 'slitProgramList'].forEach(key => {
-            const list = component[key];
-            if (!Array.isArray(list)) {
-                return;
-            }
-            list.forEach(program => {
-                if (program && (program.is_shield !== 0 || program.can_review !== 1 || program.is_review !== 1)) {
-                    forceOpenProgram(program);
-                }
-            });
-        });
-        const detailPrograms = component.programDetail?.program_list;
-        if (Array.isArray(detailPrograms)) {
-            detailPrograms.forEach(program => forceOpenProgram(program));
-        }
-    }
-    function ensurePlayableStream(component) {
-        if (!component) {
-            return;
-        }
-        forceOpenProgram(component.programObj);
-        const channelDetail = component.currChannelDetail;
-        if (channelDetail) {
-            rememberStreamAddresses(channelDetail.id, channelDetail.live_address, channelDetail.shift_address);
-        }
-        const detail = component.programDetail;
-        if (!detail) {
-            return;
-        }
-        forceOpenProgram(detail);
-        if (detail.is_exist_pad && !(detail.pad_video_info && detail.pad_video_info.play_url)) {
-            detail.is_exist_pad = 0;
-            detail.pad_src = '';
-        }
-        const channelInfo = detail.channel_info || (detail.channel_info = {});
-        const channelId = getResultChannelId(detail) || channelDetail?.id;
-        if (channelDetail) {
-            if (channelDetail.live_address) {
-                channelInfo.live_address = channelDetail.live_address;
-            }
-            if (channelDetail.shift_address) {
-                channelInfo.shift_address = channelDetail.shift_address;
-            }
-        }
-        fillStreamAddresses(channelInfo, channelId);
-    }
-    function withTimeWindow(url, program) {
-        try {
-            const u = new URL(url);
-            u.searchParams.set('start', program.start_time);
-            u.searchParams.set('end', program.end_time);
-            return u.toString();
-        } catch (e) {
-            return url + (url.includes('?') ? '&' : '?') +
-                'start=' + program.start_time + '&end=' + program.end_time;
-        }
-    }
-    function stripTimeWindow(url) {
-        try {
-            const u = new URL(url);
-            u.searchParams.delete('start');
-            u.searchParams.delete('end');
-            return u.toString();
-        } catch (e) {
-            return url
-                .replace(/&start=\d+&end=\d+(?=&|$)/g, '')
-                .replace(/\?start=\d+&end=\d+(?=&|$)/g, '?')
-                .replace(/\?$/, '');
-        }
-    }
-    function isMobileSite() {
-        try { return /^m\./.test(location.hostname); } catch (e) { return false; }
-    }
-    function getCompChannelId(component) {
-        if (!component) return null;
-        if (component.currChannel?.id != null) return component.currChannel.id;
-        if (component.currChannelDetail?.id != null) return component.currChannelDetail.id;
-        if (component.programDetail?.channel_info?.id != null) return component.programDetail.channel_info.id;
-        if (component.id != null && /^\d+$/.test(String(component.id))) return component.id;
-        if (component.programObj?.channel_id != null) return component.programObj.channel_id;
-        return null;
-    }
-    function canAutoAcquire(channelId) {
-        return channelId != null && AUTO_ACQUIRE_CHANNELS.indexOf(String(channelId)) !== -1;
-    }
-    function baseExpiryOf(entry) {
-        if (!entry) return 0;
-        if (entry.exp != null) return entry.exp;
-        return (entry.at || 0) + STREAM_NO_EXP_TTL_MS;
-    }
-    function betterBase(a, b) {
-        if (!a) return b;
-        if (!b) return a;
-        const aHasExp = a.exp != null;
-        const bHasExp = b.exp != null;
-        if (aHasExp !== bHasExp) {
-            return aHasExp ? a : b;
-        }
-        const aScript = a.src === 'script';
-        const bScript = b.src === 'script';
-        if (aScript !== bScript) {
-            return aScript ? a : b;
-        }
-        return baseExpiryOf(a) >= baseExpiryOf(b) ? a : b;
-    }
-    function playbackKey(component) {
-        if (!component) return '';
-        const program = component.programObj;
-        const channelId = getCompChannelId(component);
-        if (channelId == null || !program) return '';
-        const pid = program.id != null ? program.id
-            : (program.start_time != null ? program.start_time : '');
-        if (pid === '') return '';
-        return channelId + '|' + pid;
-    }
-    function resolveBaseEntry(channelId, kind, key) {
-        const now = Date.now();
-        if (channelId == null) return null;
-        const candidates = kind === 'shift' ? [channelShiftBaseCache[channelId]]
-            : [channelShiftBaseCache[channelId], channelLiveBaseCache[channelId]];
-        const usable = candidates
-            .filter(entry => entry && entry.url && baseExpiryOf(entry) - BASE_SAFETY_MS > now &&
-                             (kind === 'shift' || !key || !entry.key || entry.key === key));
-        if (!usable.length) {
-            noteBaseEvent('miss|' + channelId + '|' + (kind || 'live') + '|' + (key || '-'), () => {
-                dlog('[dev] 基底未命中 ch=' + channelId, 'kind=' + (kind || 'live'), 'key=' + (key || '-'));
-            });
-            return null;
-        }
-        const best = usable.reduce(betterBase);
-        const left = Math.round((baseExpiryOf(best) - now) / 1000);
-        const bucket = left > 180 ? 3 : left > 120 ? 2 : left > 90 ? 1 : 0;
-        noteBaseEvent('hit|' + channelId + '|' + best.src + '|' + (best.key || '') + '|' + bucket, () => {
-            dlog('[dev] 基底命中 ch=' + channelId, 'src=' + best.src, '剩余=' + left + 's');
-        });
-        return best;
-    }
-    function rewritePlayerConfig(component, config, isProbe) {
-        const program = component.programObj;
-        const channelId = getCompChannelId(component);
-        let url = (config.url && typeof config.url === 'string') ? config.url : '';
-        const hasStream = /\.m3u8/.test(url);
-        const hasWindow = /\bstart=\d/.test(url);
-        if (channelId != null && hasStream) {
-            const base = stripTimeWindow(url);
-            if (base) {
-                const fromShift = /[?&]start=\d+/.test(url);
-                const store = fromShift ? channelShiftBaseCache : channelLiveBaseCache;
-                const entry = { url: base, at: Date.now(), exp: parseStreamExpiry(url),
-                                key: fromShift ? '' : playbackKey(component), src: 'page' };
-                const prev = store[channelId];
-                const canStore = !prev || prev.key !== entry.key ||
-                      (entry.exp != null && (prev.exp == null || entry.exp >= prev.exp)) ||
-                      (entry.exp == null && prev.exp == null);
-                if (canStore) {
-                    store[channelId] = entry;
-                    console.log(fromShift ? '[SMGTV] 已抓取回看源' : '[SMGTV] 已抓取直播源');
-                }
-            }
-        }
-        const isReplay = config.isLive === false;
-        const pbKey = playbackKey(component);
-        const baseEntry = resolveBaseEntry(channelId, isReplay ? 'shift' : '', pbKey);
-        const baseOk = baseEntry ? baseEntry.url : '';
-        const urlExp = parseStreamExpiry(url);
-        const urlStale = hasStream && urlExp != null && urlExp - BASE_SAFETY_MS <= Date.now();
-        const forcing = Date.now() < (component.__smgPreferFreshBaseUntil || 0);
-        const staleTrigger = urlStale && (isReplay || canAutoAcquire(channelId));
-        const preferBase = !!baseEntry &&
-              (!hasStream || staleTrigger || (forcing && baseExpiryOf(baseEntry) > (urlExp || 0)));
-        dlog('[dev] ' + (isProbe ? '续期取址' : 'new播放器') + ' ch=' + channelId,
-             'key=' + (pbKey || '-'), 'isLive=', config.isLive,
-             'url=' + (url || '(空)'), 'base=' + (baseEntry ? baseEntry.src : '无'),
-             'preferBase=', preferBase, 'staleTrigger=', staleTrigger, 'hasWindow=', hasWindow,
-             'play=' + (program ? program.play : '-'),
-             'prog=' + (program && program.name ? String(program.name).slice(0, 12) : '-'));
-        if (isReplay && hasWindow) {
-            if (preferBase && program?.start_time && program?.end_time) {
-                config.url = withTimeWindow(baseOk, program);
-                component.__smgPreferFreshBaseUntil = 0;
-            } else if (urlStale) {
-                component.__smgNeedShiftBase = true;
-            }
-            return;
-        }
-        if (isReplay && hasStream && !hasWindow && program?.start_time && program?.end_time) {
-            if (!preferBase && staleTrigger) {
-                component.__smgNeedShiftBase = true;
-            }
-            const useUrl = preferBase ? baseOk : url;
-            if (preferBase) {
-                component.__smgPreferFreshBaseUntil = 0;
-            }
-            config.url = withTimeWindow(useUrl, program);
-        } else if (isReplay && !hasStream && program?.start_time && program?.end_time) {
-            if (baseOk) {
-                component.__smgPreferFreshBaseUntil = 0;
-                config.url = withTimeWindow(baseOk, program);
-                if (!isProbe) {
-                    console.log('[SMGTV] 已注入回放 频道' + channelId);
-                }
-            } else {
-                component.__smgNeedShiftBase = true;
-                dlog('[dev] 回看无基底可注入 → 标记待取源');
-            }
-        } else if (!isReplay) {
-            if (preferBase) {
-                config.url = baseOk;
-                component.__smgPreferFreshBaseUntil = 0;
-                if (!isProbe) {
-                    console.log('[SMGTV] 已注入直播 频道' + channelId + (urlStale ? '（旧地址已过期）' : ''));
-                }
-            } else if (!hasStream || staleTrigger) {
-                component.__smgNeedShiftBase = true;
-            }
-        }
-        dlog('[dev] 最终 url=' + (config.url || '(空)'));
-    }
-    function computeCurrentStreamUrl(component) {
-        const prog = component && component.programObj;
-        if (!prog) {
-            return '';
-        }
-        const probe = { url: '', isLive: prog.play !== 0 };
-        try {
-            rewritePlayerConfig(component, probe, true);
-        } catch (e) {
-            dlog('[dev] 续期取址异常：' + (e && e.message));
-            return '';
-        }
-        return typeof probe.url === 'string' ? probe.url : '';
-    }
-    function installReplayUrlPatch(component) {
-        const XGPlayer = component.$xgplayer;
-        if (!XGPlayer || component.__smgReplayPatchInstalled) {
-            return;
-        }
-        component.__smgReplayPatchInstalled = true;
-        component.$xgplayer = new Proxy(XGPlayer, {
-            construct(target, args) {
-                rewritePlayerConfig(component, args[0] || {}, false);
-                return new target(...args);
-            }
-        });
-    }
-    function wrapMobileInitPlayer(component) {
-        if (!isMobileSite()) return;
-        const original = component?.initPlayer;
-        if (!original || original.__smgMobileWrapped) return;
-        const wrapped = function (opts) {
-            if (opts && typeof opts === 'object' && 'url' in opts) {
-                const program = this?.programObj;
-                const channelId = getCompChannelId(this);
-                const current = typeof opts.url === 'string' ? opts.url : '';
-                const isReplay = opts.isLive === false;
-                const baseEntry = resolveBaseEntry(channelId, isReplay ? 'shift' : '', playbackKey(this));
-                const currentExp = parseStreamExpiry(current);
-                const currentStale = !!current && currentExp != null && currentExp - BASE_SAFETY_MS <= Date.now();
-                const canInject = !!baseEntry && (!isReplay || (program?.start_time && program?.end_time));
-                if ((!current || currentStale) && canInject) {
-                    const base = baseEntry.url;
-                    if (isReplay) {
-                        opts.url = withTimeWindow(base, program);
-                    } else {
-                        opts.url = base;
-                    }
-                    component.__smgPreferFreshBaseUntil = 0;
-                    console.log('[SMGTV] 已注入' + (isReplay ? '回放' : '直播') + ' 频道' + channelId);
-                } else if ((!current || (currentStale && (isReplay || canAutoAcquire(channelId)))) && channelId != null) {
-                    component.__smgNeedShiftBase = true;
-                    dlog('[dev] M站无基底可注入 → 标记待取源 url=' + (current || '(空)'));
-                }
-            }
-            return original.apply(this, arguments);
-        };
-        wrapped.__smgMobileWrapped = true;
-        component.initPlayer = wrapped;
-    }
-    const SITE_TZ_OFFSET_HOURS = 8;
-    function dateStrOffset(daysAgo) {
-        return new Date(Date.now() + SITE_TZ_OFFSET_HOURS * 3600000 - daysAgo * 86400000)
-            .toISOString().slice(0, 10);
-    }
-    function findTodayDonorId(component) {
-        const lists = [component?.currentProgramList, component?.playingProgramList];
-        const isEnded = p => p && p.id && p.isOutDate === 0 && p.play === 0 && serverAllowsReview(p);
-        for (const list of lists) {
-            if (!Array.isArray(list)) continue;
-            for (const p of list) {
-                if (isEnded(p) && typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1) return p.id;
-            }
-        }
-        for (const list of lists) {
-            if (!Array.isArray(list)) continue;
-            for (const p of list) {
-                if (isEnded(p)) return p.id;
-            }
-        }
-        return null;
-    }
-    function findDonorIdFromList(list) {
-        if (!Array.isArray(list)) return null;
-        const news = list.find(p => p && serverAllowsReview(p) && p.id &&
-                               typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1);
-        if (news) return news.id;
-        const any = list.find(p => p && serverAllowsReview(p) && p.id);
-        return any ? any.id : null;
-    }
-    function fetchShiftByDonor(channelId, donorId) {
-        return smgApiGet('/content/pc/tv/program/detail', { channel_program_id: donorId })
-            .then(res => {
-            const detail = res && res.result;
-            const enc = detail && detail.channel_info && detail.channel_info.shift_address;
-            if (!enc) {
-                dlog('[dev] donor detail 无 shift_address, donorId=' + donorId);
-                return null;
-            }
-            return new Promise(resolve => {
-                decryptRsaChunks(enc, url => {
-                    if (!url) return resolve(null);
-                    try {
-                        const u = new URL(url);
-                        u.searchParams.delete('start');
-                        u.searchParams.delete('end');
-                        const base = u.toString();
-                        channelShiftBaseCache[channelId] = {
-                            url: base,
-                            at: Date.now(),
-                            exp: parseStreamExpiry(url),
-                            key: '',
-                            src: 'script'
-                        };
-                        saveDonorMemo(channelId, donorId);
-                        dlog('[dev] 解密成功 路径=' + u.pathname,
-                             '剩余=' + Math.round(((parseStreamExpiry(url) || 0) - Date.now()) / 1000) + 's');
-                        console.log('[SMGTV] 已获取回看源');
-                        resolve(base);
-                    } catch (e) {
-                        resolve(null);
-                    }
-                });
-            });
-        });
-    }
-    function probeDonorDay(channelId, daysAgo) {
-        return smgApiGet('/content/pc/tv/programs', { channel_id: channelId, date: dateStrOffset(daysAgo) })
-            .then(res => {
-                const id = findDonorIdFromList(res && res.result && res.result.programs);
-                if (!id) {
-                    return null;
-                }
-                return fetchShiftByDonor(channelId, id);
-            });
-    }
-    function scanPastDays(channelId) {
-        const start = loadScanCursor(channelId);
-        let probed = 0;
-        const step = daysAgo => {
-            if (daysAgo > 7) {
-                saveScanCursor(channelId, 1);
-                console.warn('[SMGTV] 7天内未找到可用的回看源');
-                return Promise.resolve(null);
-            }
-            return probeDonorDay(channelId, daysAgo).then(url => {
-                if (url) {
-                    saveScanCursor(channelId, 1);
-                    return url;
-                }
-                saveScanCursor(channelId, daysAgo + 1);
-                probed += 1;
-                if (probed >= SCAN_DAYS_PER_TRY) {
-                    dlog('[dev] 本次取源已探 ' + probed + ' 天, 游标停在第 ' + (daysAgo + 1) + ' 天');
-                    return null;
-                }
-                return new Promise(resolve => setTimeout(resolve, SCAN_STEP_DELAY_MS))
-                    .then(() => step(daysAgo + 1));
-            });
-        };
-        return step(start);
-    }
-    function acquireFromToday(channelId, component) {
-        let candidate;
-        if (component) {
-            const todayId = findTodayDonorId(component);
-            if (todayId) {
-                candidate = todayId;
-            }
-        }
-        if (!candidate) {
-            return smgApiGet('/content/pc/tv/programs', { channel_id: channelId, date: dateStrOffset(0) })
-                .then(res => {
-                    const id = findDonorIdFromList(res && res.result && res.result.programs);
-                    if (id) {
-                        return fetchShiftByDonor(channelId, id).then(url => url || scanPastDays(channelId));
-                    }
-                    return scanPastDays(channelId);
-                });
-        }
-        return fetchShiftByDonor(channelId, candidate).then(url => url || scanPastDays(channelId));
-    }
-    function acquireShiftBase(channelId, component) {
-        const key = playbackKey(component);
-        dlog('[dev] acquire开始 ch=' + channelId, 'key=' + (key || '-'));
-        const memo = donorMemo[channelId];
-        if (memo && Date.now() - memo.at < DONOR_MEMO_TTL_MS) {
-            dlog('[dev] donor 记忆命中 id=' + memo.id);
-            return fetchShiftByDonor(channelId, memo.id).then(url => {
-                if (url) {
-                    return url;
-                }
-                dropDonorMemo(channelId);
-                return acquireFromToday(channelId, component);
-            });
-        }
-        return acquireFromToday(channelId, component);
-    }
-    const XTAB_LOCK_KEY = 'smg_shift_inflight';
-    const XTAB_LOCK_TTL_MS = 20000;
-    const XTAB_TAB_ID = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-    function crossTabBusy(channelId) {
-        try {
-            const raw = LS.getItem(XTAB_LOCK_KEY);
-            if (!raw) {
-                return false;
-            }
-            const o = JSON.parse(raw);
-            return !!o && o.id !== XTAB_TAB_ID && String(o.ch) === String(channelId) &&
-                   Date.now() - o.at < XTAB_LOCK_TTL_MS;
-        } catch (e) {
-            return false;
-        }
-    }
-    function crossTabHold(channelId) {
-        try {
-            LS.setItem(XTAB_LOCK_KEY, JSON.stringify({ id: XTAB_TAB_ID, ch: String(channelId), at: Date.now() }));
-        } catch (e) {}
-    }
-    function crossTabRelease() {
-        try {
-            const raw = LS.getItem(XTAB_LOCK_KEY);
-            const o = raw ? JSON.parse(raw) : null;
-            if (o && o.id === XTAB_TAB_ID) {
-                LS.removeItem(XTAB_LOCK_KEY);
-            }
-        } catch (e) {}
-    }
-    function maybeAutoCaptureShift(component, fromMonitor, opts) {
-        opts = opts || {};
-        if (!component || !component.__smgPatched || !component.__smgNeedShiftBase || !fromMonitor) {
-            return false;
-        }
-        const chId = getCompChannelId(component);
-        if (chId == null) {
-            return false;
-        }
-        if (!canAutoAcquire(chId)) {
-            component.__smgNeedShiftBase = false;
-            dlog('[dev] 跳过取源：频道不在自动列表 ch=' + chId);
-            return false;
-        }
-        const now = Date.now();
-        const pbKey = playbackKey(component);
-        const replayProg = component.programObj?.play === 0;
-        const hasBase = !!resolveBaseEntry(chId, replayProg ? 'shift' : '', pbKey);
-        if (hasBase && !opts.force) {
-            component.__smgNeedShiftBase = false;
-            dlog('[dev] 跳过取源：已有可用基底 key=' + (pbKey || '-'));
-            return false;
-        }
-        const cooldownKey = '__smgShiftCooldown';
-        if (component.__smgAcquiring) {
-            dlog('[dev] 跳过取源：正在取源中');
-            return false;
-        }
-        if (now - (component[cooldownKey] || 0) < 60000) {
-            throttleLog('shift-cooldown-' + chId, 5000, () => {
-                dlog('[dev] 跳过取源：冷却中 剩余=' +
-                     Math.round((60000 - (now - component[cooldownKey])) / 1000) + 's');
-            });
-            return false;
-        }
-        if (crossTabBusy(chId)) {
-            throttleLog('shift-xtab-' + chId, 5000, () => {
-                dlog('[dev] 跳过取源：另一标签页正在取源 ch=' + chId);
-            });
-            return false;
-        }
-        component[cooldownKey] = now;
-        component.__smgAcquiring = true;
-        crossTabHold(chId);
-        acquireShiftBase(chId, component).catch(err => {
-            console.warn('[SMGTV] 取源异常：', err && err.message ? err.message : err);
-            return null;
-        }).then(ok => {
-            crossTabRelease();
-            component.__smgAcquiring = false;
-            if (String(getCompChannelId(component)) !== String(chId)) return;
-            if (playbackKey(component) !== pbKey) return;
-            if (ok) {
-                const pendingReplay = !!(opts.prefetch && component.programObj && component.programObj.play === 0);
-                const idle = hasNoPlayableSource(component);
-                component[cooldownKey] = 0;
-                component.__smgAcquireFails = 0;
-                component.__smgNeedShiftBase = false;
-                if (opts.prefetch) {
-                    dlog('[dev] 后台预热完成 ch=' + chId +
-                         (pendingReplay ? '（用户已切回看，立即重建）'
-                             : (idle ? '（没有可播源，立即注入避免黑屏）' : '（不重建播放器）')));
-                }
-                const swapped = !!(opts.inPlace && applyStreamUrlInPlace(component, opts.reason || '续期'));
-                if (!swapped && component && typeof component.initPlayer === 'function' &&
-                        (opts.rebuild !== false || pendingReplay || idle)) {
-                    rememberPlaybackPosition(component, getPlayerVideo(component));
-                    if (isMobileSite()) {
-                        const prog = component.programObj;
-                        component.initPlayer({ url: '', isLive: !!(prog && prog.play === 1), autoplay: true });
-                    } else {
-                        component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
-                    }
-                }
-            } else {
-                if (opts.prefetch) {
-                    component[cooldownKey] = 0;
-                    component.__smgAcquireFails = 0;
-                    dlog('[dev] 后台预热未取到源（不占冷却，用户切回看时仍会立刻再试）');
-                    return;
-                }
-                component.__smgAcquireFails = (component.__smgAcquireFails || 0) + 1;
-                if (component.__smgAcquireFails >= 3) {
-                    component[cooldownKey] = now + 10 * 60 * 1000;
-                    console.warn('[SMGTV] 暂无可用播放源');
-                }
-            }
-        });
-        return true;
-    }
-    function maybePrefetchShiftBase(component) {
-        if (!component || !component.__smgPatched) {
-            return false;
-        }
-        const chId = getCompChannelId(component);
-        if (chId == null || !canAutoAcquire(chId)) {
-            return false;
-        }
-        const prog = component.programObj;
-        if (!prog || prog.play !== 1) {
-            return false;
-        }
-        const cached = channelShiftBaseCache[chId];
-        if (cached && cached.url && baseExpiryOf(cached) - BASE_SAFETY_MS > Date.now()) {
-            return false;
-        }
-        const idleNow = hasNoPlayableSource(component);
-        if (!component.__smgWatchAt) {
-            component.__smgWatchAt = Date.now();
-            if (!idleNow) { return false; }
-        }
-        if (!idleNow && Date.now() - component.__smgWatchAt < PREFETCH_SHIFT_DELAY_MS) {
-            return false;
-        }
-        if (component.__smgAcquiring ||
-                Date.now() - (component.__smgPrefetchAt || 0) < PREFETCH_SHIFT_RETRY_MS) {
-            return false;
-        }
-        component.__smgPrefetchAt = Date.now();
-        component.__smgWatchAt = Date.now();
-        dlog('[dev] 后台预热回看基底 ch=' + chId + (idleNow ? '（没有可播源，不等待）' : ''));
-        component.__smgNeedShiftBase = true;
-        return maybeAutoCaptureShift(component, true, { force: true, rebuild: false, prefetch: true });
-    }
-    function rebuildCurrentPlayer(component) {
-        if (!component.programObj?.id && typeof component.initNoProgramPlayer === 'function') {
-            component.initNoProgramPlayer();
-        } else if (isMobileSite()) {
-            component.initPlayer({ url: '', isLive: component.programObj?.play === 1, autoplay: true });
-        } else {
-            component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
-        }
-    }
-    function refreshOfficialStream(component, reason) {
-        const key = playbackKey(component);
-        const programId = component.programObj?.id;
-        const chId = getCompChannelId(component);
-        if (!programId || chId == null || component.__smgRefreshingDetails) return false;
-        if (Date.now() - (component.__smgDetailRefreshAt || 0) < STREAM_RENEW_COOLDOWN_MS) return false;
-        component.__smgDetailRefreshAt = Date.now();
-        component.__smgRefreshingDetails = true;
-        smgApiGet('/content/pc/tv/program/detail', { channel_program_id: programId })
-            .then(res => new Promise(resolve => {
-                const detail = res && String(res.code) === '1000' && res.result;
-                const replay = component.programObj?.play === 0;
-                const enc = detail?.channel_info?.[replay ? 'shift_address' : 'live_address'];
-                if (!enc || playbackKey(component) !== key ||
-                        String(getResultChannelId(detail)) !== String(chId)) return resolve(null);
-                decryptRsaChunks(enc, url => resolve(url ? { detail, url, replay } : null));
-            }))
-            .then(result => {
-                if (!result || playbackKey(component) !== key) return;
-                const exp = parseStreamExpiry(result.url);
-                if (exp != null && exp - BASE_SAFETY_MS <= Date.now()) return;
-                const cache = result.replay ? channelShiftBaseCache : channelLiveBaseCache;
-                cache[chId] = { url: stripTimeWindow(result.url), at: Date.now(), exp,
-                    key: result.replay ? '' : key, src: 'script' };
-                component.programDetail = result.detail;
-                ensurePlayableStream(component);
-                component.__smgPreferFreshBaseUntil = Date.now() + 30000;
-                if (!applyStreamUrlInPlace(component, reason)) {
-                    rememberPlaybackPosition(component, getPlayerVideo(component));
-                    rebuildCurrentPlayer(component);
-                }
-            })
-            .catch(err => console.warn('[SMGTV] 刷新节目地址失败', err && err.message))
-            .finally(() => { component.__smgRefreshingDetails = false; });
-        return true;
-    }
-    function applyStreamUrlInPlace(component, reason) {
-        const player = component && component.player;
-        if (!player || typeof player.switchURL !== 'function') {
-            dlog('[dev] 就地换源：播放器不支持 switchURL → 回退重建');
-            return false;
-        }
-        if (player.root && player.root.isConnected === false) {
-            dlog('[dev] 就地换源：播放器实例已脱离文档 → 回退重建');
-            return false;
-        }
-        const url = computeCurrentStreamUrl(component);
-        if (!url) {
-            dlog('[dev] 就地换源：取不到可用地址 → 回退重建');
-            return false;
-        }
-        const isReplay = component.programObj?.play === 0;
-        const video = getPlayerVideo(component);
-        const wasPaused = !!(video && video.paused);
-        const key = playbackKey(component);
-        const supportsSeamless = /seamless/.test(String(player.switchURL));
-        const useSeamless = !isReplay && supportsSeamless;
-        const switchOpts = useSeamless ? { seamless: true, startTime: 0 }
-            : (isReplay ? undefined : { startTime: 0 });
-        try {
-            const ret = player.switchURL(url, switchOpts);
-            console.log('[SMGTV] 播放源续期（' + reason + '）已就地换源，不重建播放器' +
-                        (useSeamless ? '（seamless 无缝）' : ''));
-            dlog('[dev] 就地换源 模式=' + (isReplay ? '回看(按进度续播)' :
-                 (useSeamless ? '直播(seamless 续播)' : '直播(回直播边缘)')),
-                 'supportsSeamless=' + supportsSeamless,
-                 'url=' + String(url).slice(0, 90));
-            if (useSeamless) {
-                armSeamlessFallback(component, player, key, video);
-            }
-            if (ret && typeof ret.then === 'function') {
-                ret.then(() => {
-                    if (wasPaused) {
-                        try { player.pause(); } catch (e) {}
-                    }
-                }).catch(err => {
-                    console.warn('[SMGTV] 就地换源未完成：', err && err.message ? err.message : err);
-                    if (component.player === player && playbackKey(component) === key) {
-                        rememberPlaybackPosition(component, getPlayerVideo(component));
-                        rebuildCurrentPlayer(component);
-                    }
-                });
-            }
-            return true;
-        } catch (e) {
-            dlog('[dev] 就地换源抛错：' + (e && e.message) + ' → 回退重建');
-            return false;
-        }
-    }
-    function armSeamlessFallback(component, player, key, video) {
-        clearTimeout(component.__smgSeamlessTimer);
-        const startPos = video ? video.currentTime : 0;
-        component.__smgSeamlessTimer = setTimeout(() => {
-            component.__smgSeamlessTimer = 0;
-            if (component.player !== player || playbackKey(component) !== key) return;
-            const nowVideo = getPlayerVideo(component);
-            const advanced = nowVideo && nowVideo.currentTime > startPos + 0.25;
-            const playable = nowVideo && !nowVideo.paused && nowVideo.readyState >= 2;
-            if (advanced && playable) return;
-            console.warn('[SMGTV] seamless 换源 ' + SEAMLESS_FALLBACK_MS / 1000 +
-                         's 内未起播，回退重建');
-            rememberPlaybackPosition(component, nowVideo);
-            rebuildCurrentPlayer(component);
-        }, SEAMLESS_FALLBACK_MS);
-    }
-    function forceRenewStream(component, reason, rebuild, inPlace) {
-        const chId = getCompChannelId(component);
-        if (chId == null) {
-            return false;
-        }
-        throttleLog('renew-log', 30000, () => {
-            console.log('[SMGTV] 播放源失效（' + reason + '），正在重新获取 频道' + chId);
-        });
-        if (!canAutoAcquire(chId)) {
-            return refreshOfficialStream(component, reason);
-        }
-        component.__smgNeedShiftBase = true;
-        if (rebuild || inPlace) {
-            component.__smgPreferFreshBaseUntil = Date.now() + 30000;
-        }
-        return maybeAutoCaptureShift(component, true,
-            { force: true, rebuild: rebuild !== false, inPlace: !!inPlace, reason: reason });
-    }
-    function detectPlaybackFailure(component, video) {
-        if (!video) {
-            return null;
-        }
-        const err = video.error;
-        if (err && err.code !== 1) {
-            component.__smgStallWatch = null;
-            return '媒体错误 code=' + err.code;
-        }
-        if (!video.ended && component.player?.root?.classList?.contains('xgplayer-is-error')) {
-            component.__smgStallWatch = null;
-            return '播放器报告加载错误';
-        }
-        if (video.paused || video.ended || video.seeking) {
-            component.__smgStallWatch = null;
-            clearStuckStart(component);
-            return null;
-        }
-        const now = Date.now();
-        if (video.currentTime < 1) {
-            component.__smgStallWatch = null;
-            const rs = video.readyState;
-            if (component.__smgStuckVideo !== video || component.__smgStuckAt == null ||
-                    rs !== (component.__smgStuckReady || 0)) {
-                component.__smgStuckVideo = video;
-                component.__smgStuckReady = rs;
-                component.__smgStuckAt = now;
-                return null;
-            }
-            if (video.networkState === 3) {
-                return '源无法加载';
-            }
-            if (now - component.__smgStuckAt >= STUCK_START_TIMEOUT_MS) {
-                return '一直未能起播 ' + Math.round((now - component.__smgStuckAt) / 1000) + ' 秒';
-            }
-            return null;
-        }
-        clearStuckStart(component);
-        const watch = component.__smgStallWatch;
-        if (!watch || watch.video !== video) {
-            component.__smgStallWatch = { video: video, time: video.currentTime, at: now };
-            return null;
-        }
-        if (video.currentTime > watch.time + 0.25) {
-            component.__smgRecoverCount = 0;
-            component.__smgAcquireFails = 0;
-            watch.time = video.currentTime;
-            watch.at = now;
-            return null;
-        }
-        if (video.currentTime < watch.time - 0.25) {
-            watch.time = video.currentTime;
-            watch.at = now;
-            return null;
-        }
-        if (now - watch.at >= STALL_TIMEOUT_MS) {
-            return '画面停滞 ' + Math.round((now - watch.at) / 1000) + ' 秒';
-        }
-        return null;
-    }
-    function clearStuckStart(component) {
-        component.__smgStuckAt = null;
-        component.__smgStuckVideo = null;
-        component.__smgStuckReady = 0;
-    }
-    function rememberPlaybackPosition(component, video) {
-        if (!video || !(video.currentTime > 5)) {
-            return;
-        }
-        component.__smgResumeAt = video.currentTime;
-        component.__smgResumeVideo = video;
-        component.__smgResumeAt_ts = Date.now();
-    }
-    function clearResumePosition(component) {
-        component.__smgResumeAt = null;
-        component.__smgResumeVideo = null;
-        component.__smgResumeAt_ts = 0;
-    }
-    function resumePlaybackPosition(component, video) {
-        const at = component.__smgResumeAt;
-        if (at == null || !video) {
-            return;
-        }
-        if (Date.now() - (component.__smgResumeAt_ts || 0) > RESUME_POSITION_TTL_MS) {
-            clearResumePosition(component);
-            return;
-        }
-        if (video.seeking) {
-            return;
-        }
-        if (component.__smgResumeVideo === video && video.currentTime >= at - 3) {
-            return;
-        }
-        if (video.readyState < 2) {
-            return;
-        }
-        if (!isFinite(video.duration)) {
-            if (!isNaN(video.duration)) {
-                clearResumePosition(component);
-            }
-            return;
-        }
-        clearResumePosition(component);
-        if (at > video.duration - 2) {
-            return;
-        }
-        if (Math.abs(video.currentTime - at) > 3) {
-            try {
-                video.currentTime = at;
-                console.log('[SMGTV] 已恢复到中断前进度 ' + Math.round(at) + 's');
-            } catch (e) {}
-        }
-    }
-    function recoverPlayerIfNeeded(component) {
-        if (!component || typeof component.initPlayer !== 'function') {
-            return;
-        }
-        const now = Date.now();
-        if (now < (component.__smgRecoveringUntil || 0)) {
-            return;
-        }
-        const video = getPlayerVideo(component);
-        const reason = detectPlaybackFailure(component, video);
-        if (!reason) {
-            return;
-        }
-        component.__smgRecoverCount = (component.__smgRecoverCount || 0) + 1;
-        const backoff = Math.min(
-            RECOVER_COOLDOWN_MS * Math.pow(2, Math.min(component.__smgRecoverCount - 1, 5)),
-            RECOVER_MAX_COOLDOWN_MS);
-        component.__smgRecoveringUntil = now + backoff;
-        component.__smgStallWatch = null;
-        clearStuckStart(component);
-        throttleLog('recover-log', 30000, () => {
-            console.log('[SMGTV] 播放中断（' + reason + '），第 ' + component.__smgRecoverCount + ' 次恢复');
-        });
-        dlog('[dev] 恢复重建 原因=' + reason, '退避=' + Math.round(backoff / 1000) + 's');
-        rememberPlaybackPosition(component, video);
-        ensurePlayableStream(component);
-        if (!forceRenewStream(component, reason, true)) {
-            rebuildCurrentPlayer(component);
-        }
-    }
-    function resetChannelScopedState(component) {
-        const chId = getCompChannelId(component);
-        if (chId == null || chId === component.__smgLastChannelId) {
-            return;
-        }
-        component.__smgLastChannelId = chId;
-        component.__smgShiftCooldown = 0;
-        component.__smgAcquireFails = 0;
-        component.__smgAcquiring = false;
-        component.__smgNeedShiftBase = false;
-        component.__smgLastRenewAt = 0;
-        component.__smgLastRenewRebuildAt = 0;
-        component.__smgRenewedExp = 0;
-        component.__smgRecoveringUntil = 0;
-        component.__smgRecoverCount = 0;
-        component.__smgStallWatch = null;
-        clearResumePosition(component);
-        component.__smgPreferFreshBaseUntil = 0;
-        component.__smgWatchAt = 0;
-        component.__smgPrefetchAt = 0;
-        clearStuckStart(component);
-    }
-    function maintainStreamFreshness(component) {
-        const chId = getCompChannelId(component);
-        if (chId == null) {
-            return;
-        }
-        const kind = component.programObj?.play === 0 ? 'shift' : '';
-        const entry = resolveBaseEntry(chId, kind, playbackKey(component));
-        const now = Date.now();
-        const probe = entry ? null : probePlayerUrl(component);
-        const exp = entry ? baseExpiryOf(entry) : (probe ? probe.exp : null);
-        if (!exp) {
-            throttleLog('renew-check-' + chId, 15000, () => {
-                dlog('[dev] 续期检查：播放地址解析不出期限，跳过');
-            });
-            return;
-        }
-        const anchor = (entry && entry.at) || (probe && probe.iat) ||
-            (exp - STREAM_NO_EXP_TTL_MS);
-        const lifetime = Math.max(Math.min(exp - anchor, 3600000), 60000);
-        const margin = entry
-            ? Math.min(STREAM_RENEW_MARGIN_MS, Math.max(lifetime * 0.15, 15000))
-            : STREAM_RENEW_MARGIN_MS;
-        const left = exp - now;
-        if (left <= margin + 60000) {
-            throttleLog('renew-check-' + chId, 30000, () => {
-                dlog('[dev] 续期检查：剩余=' + Math.round(left / 1000) + 's',
-                     '阈值=' + Math.round(margin / 1000) + 's',
-                     '来源=' + (entry ? entry.src : 'url'));
-            });
-        }
-        if (left > margin) {
-            return;
-        }
-        if (component.__smgRenewedExp === exp) {
-            throttleLog('renew-done-' + chId, 60000, () => {
-                dlog('[dev] 该期限已续期过，不再重复');
-            });
-            return;
-        }
-        if (now - (component.__smgLastRenewAt || 0) < STREAM_RENEW_COOLDOWN_MS) {
-            return;
-        }
-        component.__smgLastRenewAt = now;
-        component.__smgRenewedExp = exp;
-        const video = getPlayerVideo(component);
-        const playing = isVideoReady(video);
-        const rebuildGap = Math.max(60000, lifetime * 0.4);
-        const canRebuild = playing && now - (component.__smgLastRenewRebuildAt || 0) >= rebuildGap;
-        if (canRebuild) {
-            component.__smgLastRenewRebuildAt = now;
-            component.__smgPreferFreshBaseUntil = now + 30000;
-            rememberPlaybackPosition(component, video);
-        }
-        forceRenewStream(component, '地址临近到期', canRebuild, true);
-    }
-    function getScriptVersion() {
-        try {
-            if (typeof GM_info === 'undefined') return '';
-            const v = GM_info && GM_info.script && GM_info.script.version;
-            return typeof v === 'string' ? v.trim() : '';
-        } catch (e) {
-            return '';
-        }
-    }
-    function compareVersions(a, b) {
-        const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
-        const pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
-        const len = Math.max(pa.length, pb.length);
-        for (let i = 0; i < len; i += 1) {
-            const x = pa[i] || 0;
-            const y = pb[i] || 0;
-            if (x !== y) return x > y ? 1 : -1;
-        }
-        return 0;
-    }
-    function parseRemoteVersion(text) {
-        const m = /^\s*\/\/\s*@version\s+(\S+)\s*$/m.exec(String(text || ''));
-        return m ? m[1] : '';
-    }
-    function lsGet(key) {
-        try { return LS.getItem(key); } catch (e) { return null; }
-    }
-    function lsSet(key, value) {
-        try { LS.setItem(key, value); } catch (e) {}
-    }
-    function todayStamp() {
-        const d = new Date();
-        return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
-    }
-    function showUpdateTag(latest) {
-        if (document.getElementById(UPDATE_TAG_ID) || document.getElementById(UPDATE_BADGE_ID)) return;
-        if (lsGet(UPDATE_LS_DISMISSED) === todayStamp()) return;
-        injectUpdateStyle();
-        const tag = document.createElement('div');
-        tag.id = UPDATE_TAG_ID;
-        tag.setAttribute('role', 'status');
-        const body = document.createElement('div');
-        body.className = 'smgtv-update-body';
-        const text = document.createElement('span');
-        text.className = 'smgtv-update-text';
-        text.textContent = '脚本有新版本 ' + latest + '，请及时更新';
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.textContent = '立即更新';
-        btn.addEventListener('click', () => {
-            try { UW.open(UPDATE_INSTALL_URL, '_blank'); } catch (e) {}
-        });
-        const close = document.createElement('button');
-        close.type = 'button';
-        close.className = 'smgtv-update-close';
-        close.setAttribute('aria-label', '关闭');
-        close.textContent = '×';
-        close.addEventListener('click', () => {
-            lsSet(UPDATE_LS_DISMISSED, todayStamp());
-            clearTimeout(tag.__smgCollapseTimer);
-            badge.remove();
-            tag.remove();
-        });
-        body.appendChild(text);
-        body.appendChild(btn);
-        body.appendChild(close);
-        tag.appendChild(body);
-        const badge = document.createElement('div');
-        badge.id = UPDATE_BADGE_ID;
-        badge.className = 'smgtv-update-badge';
-        badge.textContent = '新';
-        badge.setAttribute('title', '有脚本新版本，点击展开');
-        badge.addEventListener('click', () => expandUpdateTag(tag));
-        badge.addEventListener('mouseenter', () => expandUpdateTag(tag));
-        badge.addEventListener('mouseleave', () => scheduleUpdateCollapse(tag));
-        (document.body || document.documentElement).appendChild(tag);
-        (document.body || document.documentElement).appendChild(badge);
-        tag.__smgBadge = badge;
-        tag.addEventListener('mouseenter', () => expandUpdateTag(tag));
-        tag.addEventListener('mouseleave', () => scheduleUpdateCollapse(tag));
-        tag.classList.add('smgtv-update-entering');
-        try {
-            void tag.offsetWidth;
-            requestAnimationFrame(() => tag.classList.remove('smgtv-update-entering'));
-        } catch (e) {
-            tag.classList.remove('smgtv-update-entering');
-        }
-        scheduleUpdateCollapse(tag);
-        dlog('[dev] 更新提示已弹出 latest=' + latest);
-    }
-    function updateTagNodes(tag) {
-        return [tag, tag && tag.__smgBadge].filter(Boolean);
-    }
-    function expandUpdateTag(tag) {
-        if (!tag || !tag.isConnected) return;
-        clearTimeout(tag.__smgCollapseTimer);
-        tag.__smgCollapseTimer = 0;
-        updateTagNodes(tag).forEach(n => n.classList.remove('smgtv-update-collapsed'));
-    }
-    function scheduleUpdateCollapse(tag) {
-        if (!tag || !tag.isConnected) return;
-        clearTimeout(tag.__smgCollapseTimer);
-        tag.__smgCollapseTimer = setTimeout(() => {
-            if (!tag.isConnected || tag.matches(':hover')) return;
-            const badge = tag.__smgBadge;
-            if (badge && badge.matches(':hover')) return;
-            updateTagNodes(tag).forEach(n => n.classList.add('smgtv-update-collapsed'));
-        }, UPDATE_COLLAPSE_MS);
-    }
-    function injectUpdateStyle() {
-        if (document.getElementById(UPDATE_STYLE_ID)) return;
-        const style = document.createElement('style');
-        style.id = UPDATE_STYLE_ID;
-        style.textContent = [
-            '#' + UPDATE_TAG_ID + '{position:fixed;right:16px;bottom:16px;z-index:2147483646;',
-            'display:flex;align-items:center;gap:10px;max-width:calc(100vw - 32px);',
-            'padding:10px 12px;border-radius:8px;background:#1f2329;color:#fff;',
-            'font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
-            'box-shadow:0 4px 16px rgba(0,0,0,.35);',
-            'transform-origin:right bottom;will-change:transform,opacity;',
-            'transition:transform .3s cubic-bezier(.18,.89,.32,1.28),',
-            'opacity .3s ease-out;}',
-            '#' + UPDATE_TAG_ID + ':not(.smgtv-update-collapsed){',
-            'transition:transform .34s cubic-bezier(.18,.89,.32,1.28),',
-            'opacity .24s ease-out;}',
-            '#' + UPDATE_TAG_ID + ' .smgtv-update-text{white-space:nowrap;}',
-            '#' + UPDATE_TAG_ID + ' button{flex:none;border:0;border-radius:5px;cursor:pointer;',
-            'font:inherit;padding:5px 10px;background:#3b82f6;color:#fff;',
-            'transition:background-color .15s ease,transform .2s ease;}',
-            '#' + UPDATE_TAG_ID + ' button:hover{background:#2563eb;}',
-            '#' + UPDATE_TAG_ID + ' button:active{transform:scale(.94);}',
-            '#' + UPDATE_TAG_ID + ' .smgtv-update-close{padding:2px 7px;background:transparent;',
-            'color:#c9ced6;font-size:18px;line-height:1;}',
-            '#' + UPDATE_TAG_ID + ' .smgtv-update-close:hover{background:rgba(255,255,255,.12);',
-            'color:#fff;}',
-            '#' + UPDATE_TAG_ID + ' .smgtv-update-body{display:flex;align-items:center;gap:10px;',
-            'transition:opacity .2s ease-out,transform .3s cubic-bezier(.18,.89,.32,1.28);}',
-            '#' + UPDATE_BADGE_ID + '{position:fixed;right:16px;bottom:16px;',
-            'z-index:2147483646;width:40px;height:40px;',
-            'border-radius:50%;background:#3b82f6;color:#fff;',
-            'display:flex;align-items:center;justify-content:center;cursor:pointer;',
-            'font:600 15px/1 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;',
-            'box-shadow:0 3px 12px rgba(0,0,0,.3);user-select:none;',
-            'transform-origin:right bottom;will-change:transform,opacity;',
-            'opacity:0;transform:scale(0);pointer-events:none;',
-            'transition:transform .3s cubic-bezier(.18,.89,.32,1.28),',
-            'opacity .3s ease-out;}',
-            '#' + UPDATE_TAG_ID + '.smgtv-update-entering{opacity:0;',
-            'transform:translateX(40px) scale(.88);',
-            'transition:none;}',
-            '#' + UPDATE_TAG_ID + '.smgtv-update-collapsed{transform:scale(0);',
-            'opacity:0;pointer-events:none;}',
-            '#' + UPDATE_BADGE_ID + '.smgtv-update-collapsed{opacity:1;',
-            'transform:scale(1);pointer-events:auto;}',
-            '@media (prefers-reduced-motion:reduce){#' + UPDATE_TAG_ID + ',',
-            '#' + UPDATE_TAG_ID + ' .smgtv-update-body,',
-            '#' + UPDATE_BADGE_ID + ',#' + UPDATE_TAG_ID + ' button{transition:none;}}',
-            '@media (prefers-color-scheme:light){#' + UPDATE_TAG_ID + '{background:#fff;',
-            'color:#1f2329;border:1px solid #e3e6eb;box-shadow:0 4px 16px rgba(0,0,0,.12);}',
-            '#' + UPDATE_TAG_ID + ' .smgtv-update-close{color:#6b7280;}}'
-        ].join('');
-        (document.head || document.documentElement).appendChild(style);
-    }
-    function checkScriptUpdate() {
-        const current = getScriptVersion();
-        if (!current) return;
-        if (typeof GM_info !== 'undefined' && GM_info.script) {
-            const updateUrl = GM_info.scriptUpdateURL ||
-                (GM_info.script && GM_info.script.updateURL);
-            if (!updateUrl) return;
-        }
-        const latest = lsGet(UPDATE_LS_LATEST);
-        if (latest && compareVersions(latest, current) > 0) {
-            try {
-                showUpdateTag(latest);
-            } catch (e) {
-                console.warn('[SMGTV] 更新提示创建失败:', e && e.message);
-            }
-            return;
-        }
-        const last = parseInt(lsGet(UPDATE_LS_CHECKED) || '0', 10) || 0;
-        if (Date.now() - last < UPDATE_CHECK_INTERVAL_MS) return;
-        const fetcher = RAW_FETCH || (typeof fetch === 'function' ? fetch.bind(window) : null);
-        if (!fetcher) return;
-        let done = false;
-        const finish = text => {
-            if (done) return;
-            done = true;
-            const remote = parseRemoteVersion(text);
-            if (!remote) {
-                throttleLog('update-parse-fail', 60000, () => {
-                    console.warn('[SMGTV] 更新检查：远端脚本未解析出版本号');
-                });
-                return;
-            }
-            lsSet(UPDATE_LS_CHECKED, String(Date.now()));
-            lsSet(UPDATE_LS_LATEST, remote);
-            if (compareVersions(remote, current) > 0) {
-                try {
-                    showUpdateTag(remote);
-                } catch (e) {
-                    console.warn('[SMGTV] 更新提示创建失败:', e && e.message);
-                }
-            }
-        };
-        try {
-            Promise.resolve(fetcher(UPDATE_CHECK_URL, {
-                method: 'GET',
-                credentials: 'omit'
-            })).then(resp => {
-                if (!resp || typeof resp.text !== 'function') return '';
-                return resp.text();
-            }).then(finish).catch(() => {
-                lsSet(UPDATE_LS_CHECKED, String(Date.now() - UPDATE_CHECK_INTERVAL_MS + 1800000));
-                throttleLog('update-check-fail', 60000, () => {
-                    console.warn('[SMGTV] 更新检查失败（网络不可用或跨域被拦），30 分钟后重试');
-                });
-            });
-        } catch (e) {
-            throttleLog('update-check-error', 60000, () => {
-                console.warn('[SMGTV] 更新检查异常：', e && e.message);
-            });
-        }
-    }
-    function injectStyle(cssText) {
-        const appendStyle = () => {
-            if (document.getElementById(STYLE_ID)) {
-                return;
-            }
-            const style = document.createElement('style');
-            style.id = STYLE_ID;
-            style.textContent = cssText;
-            (document.head || document.documentElement).appendChild(style);
-        };
-        if (document.head || document.documentElement) {
-            appendStyle();
-        } else {
-            document.addEventListener('DOMContentLoaded', appendStyle, { once: true });
-        }
-    }
-    function ensureViewportFitCover() {
-        const apply = () => {
-            try {
-                const meta = document.querySelector('meta[name="viewport"]');
-                if (meta) {
-                    const content = meta.getAttribute('content') || '';
-                    if (!/viewport-fit\s*=\s*cover/i.test(content)) {
-                        meta.setAttribute('content', content ? content + ', viewport-fit=cover' : 'viewport-fit=cover');
-                    }
-                    return;
-                }
-                const created = document.createElement('meta');
-                created.setAttribute('name', 'viewport');
-                created.setAttribute('content', 'width=device-width, initial-scale=1, viewport-fit=cover');
-                (document.head || document.documentElement).appendChild(created);
-            } catch (e) {
-                throttleLog('viewport-error', 5000, () => console.warn('[SMGTV] 设置 viewport-fit 失败:', e));
-            }
-        };
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', apply, { once: true });
-        } else {
-            apply();
-        }
-    }
-    function getVueInstance(el) {
-        return el?.__vue__ || el?.__vueParentComponent?.proxy || null;
-    }
-    function isTVComponent(instance) {
-        return !!instance && (
-            typeof instance.initPlayer === 'function' ||
-            typeof instance.playProgram === 'function' ||
-            typeof instance.setLiveTimer === 'function' ||
-            ('isLoading' in instance && 'player' in instance)
-        );
-    }
-    function findComponentFromElement(el) {
-        let current = el;
-        while (current) {
-            const instance = getVueInstance(current);
-            if (isTVComponent(instance)) {
-                return instance;
-            }
-            current = current.parentElement;
-        }
-        return null;
-    }
-    function findTVComponent() {
-        const selectors = ['.huikan', '.live-container', '.live-box', '.live-player', '.tv', '.player-box'];
-        for (const selector of selectors) {
-            const component = findComponentFromElement(document.querySelector(selector));
-            if (component) {
-                return component;
-            }
-        }
-        return null;
-    }
-    function dlogComponentDiag() {
-        if (!DEV_LOG) { return; }
-        try {
-            const selectors = ['.huikan', '.live-container', '.live-box', '.live-player', '.tv', '.player-box'];
-            const found = selectors.map(s => {
-                const el = document.querySelector(s);
-                if (!el) return s + '=无';
-                const inst = getVueInstance(el);
-                return s + '=有' + (inst ? '(vue:是' + (isTVComponent(inst) ? ',判据命中' : ',判据未命中') + ')' : '(vue:否)');
-            });
-            const appEl = document.querySelector('#app') || document.querySelector('[data-v-app]');
-            const anyVue = document.querySelector('[data-v-app]') ||
-                (appEl && (getVueInstance(appEl) || appEl.__vue__));
-            const videos = document.querySelectorAll('video').length;
-            dlog('[dev] 组件自检（10s 未命中，疑似站点结构变化）',
-                 '候选=' + found.join(' '),
-                 '页面存在Vue痕迹=' + !!anyVue,
-                 'video元素数=' + videos,
-                 'readyState=' + document.readyState,
-                 'url=' + location.href);
-        } catch (e) {
-            dlog('[dev] 组件自检异常：' + (e && e.message));
-        }
-    }
-    let urlExpProbe = { url: '', exp: null, iat: null };
-    function probePlayerUrl(component) {
-        const url = currentPlayerUrl(component);
-        if (!url) {
-            return { url: '', exp: null, iat: null };
-        }
-        if (url === urlExpProbe.url) {
-            return urlExpProbe;
-        }
-        urlExpProbe = { url: url, exp: parseStreamExpiry(url), iat: parseStreamIssuedAt(url) };
-        return urlExpProbe;
-    }
-    function currentPlayerUrl(component) {
-        const video = getPlayerVideo(component);
-        const src = video && typeof video.src === 'string' ? video.src : '';
-        if (src && /\.m3u8/.test(src)) {
-            return src;
-        }
-        const cfg = component?.player?.config;
-        if (cfg && typeof cfg.url === 'string') {
-            return cfg.url;
-        }
-        return src || '';
-    }
-    function getPlayerVideo(component) {
-        const player = component?.player;
-        return player?.video ||
-            player?.media ||
-            player?.root?.querySelector?.('video') ||
-            component?.$refs?.livePlayer?.querySelector?.('video') ||
-            document.querySelector('.live-player video, .player-box video, .xgplayer video, video');
-    }
-    function isVideoReady(video) {
-        return !!video && !video.error && (
-            video.readyState >= 2 ||
-            (!video.paused && video.currentTime > 0)
-        );
-    }
-    function hasNoPlayableSource(component) {
-        const player = component && component.player;
-        if (!player) { return true; }
-        const cfg = player.config;
-        if (cfg && typeof cfg.url === 'string') { return !cfg.url; }
-        const video = getPlayerVideo(component);
-        if (!video) { return true; }
-        return !!video.error;
-    }
-    function setVideoReadyClass(isReady) {
-        const target = document.body || document.documentElement;
-        target?.classList?.toggle(VIDEO_READY_CLASS, isReady);
-    }
-    function syncLoadingState(component) {
-        forceOpenProgramList(component);
-        maybeAutoCaptureShift(component, false);
-        recoverPlayerIfNeeded(component);
-        const video = getPlayerVideo(component);
-        if (video) {
-            watchPlayerVideo(component, video);
-        }
-        const isReady = isVideoReady(video);
-        setVideoReadyClass(isReady);
-        if (isReady && component && component.isLoading) {
-            component.isLoading = false;
-        }
-        return isReady;
-    }
-    function watchPlayerVideo(component, video) {
-        if (!video || watchedVideos.has(video)) {
-            return;
-        }
-        watchedVideos.add(video);
-        const markReady = () => {
-            resumePlaybackPosition(component, video);
-            syncLoadingState(component);
-        };
-        const resetReady = () => {
-            if (!isVideoReady(video)) {
-                setVideoReadyClass(false);
-            }
-        };
-        VIDEO_READY_EVENTS.forEach(eventName => {
-            video.addEventListener(eventName, markReady, { passive: true });
-        });
-        VIDEO_RESET_EVENTS.forEach(eventName => {
-            video.addEventListener(eventName, resetReady, { passive: true });
-        });
-        video.addEventListener('webkitbeginfullscreen', () => {
-            wantFullscreen = true;
-            dlog('[dev] iOS 视频进入原生全屏');
-            syncFullscreenButtonState(component, true);
-        }, { passive: true });
-        video.addEventListener('webkitendfullscreen', () => {
-            wantFullscreen = false;
-            dlog('[dev] iOS 视频退出原生全屏 → 清除全屏意图');
-            syncFullscreenButtonState(component, false);
-        }, { passive: true });
-        markReady();
-    }
-    function cleanupComponent(component) {
-        if (!component) {
-            return;
-        }
-        if (component.__smgLoadingMonitor) {
-            clearInterval(component.__smgLoadingMonitor);
-            component.__smgLoadingMonitor = null;
-        }
-        if (component.__smgSeamlessTimer) {
-            clearTimeout(component.__smgSeamlessTimer);
-            component.__smgSeamlessTimer = 0;
-        }
-        if (component.__smgLoadingObserver) {
-            component.__smgLoadingObserver.disconnect();
-            component.__smgLoadingObserver = null;
-        }
-        if (component.pageVisibilityChange) {
-            document.removeEventListener('visibilitychange', component.pageVisibilityChange);
-        }
-    }
-    function startLoadingMonitor(component) {
-        if (!component || component.__smgLoadingMonitor) {
-            return;
-        }
-        component.__smgLoadingMonitor = setInterval(() => {
-            const rootEl = component.$el;
-            if (rootEl && !rootEl.isConnected) {
-                cleanupComponent(component);
-                initComponentPatch();
-                return;
-            }
-            resetChannelScopedState(component);
-            maybeAutoCaptureShift(component, true);
-            maybePrefetchShiftBase(component);
-            pruneStaleFullscreenHost();
-            maintainStreamFreshness(component);
-            syncLoadingState(component);
-        }, 500);
-        if (component.$refs?.livePlayer && !component.__smgLoadingObserver) {
-            component.__smgLoadingObserver = new MutationObserver(() => syncLoadingState(component));
-            component.__smgLoadingObserver.observe(component.$refs.livePlayer, {
-                childList: true,
-                subtree: true
-            });
-        }
-    }
-    function getBrowserFullscreenElement() {
-        return document.fullscreenElement ||
-            document.webkitFullscreenElement ||
-            document.mozFullScreenElement ||
-            document.msFullscreenElement ||
-            null;
-    }
-    function requestElementFullscreen(el) {
-        if (!el) {
-            return Promise.reject(new Error('missing fullscreen target'));
-        }
-        const request =
-              el.requestFullscreen ||
-              el.webkitRequestFullscreen ||
-              el.webkitRequestFullScreen ||
-              el.mozRequestFullScreen ||
-              el.msRequestFullscreen;
-        if (!request) {
-            return Promise.reject(new Error('fullscreen api unavailable'));
-        }
-        try {
-            const result = request.call(el);
-            return result && typeof result.then === 'function' ? result : Promise.resolve();
-        } catch (e) {
-            return Promise.reject(e);
-        }
-    }
-    function exitBrowserFullscreen() {
-        const exit =
-              document.exitFullscreen ||
-              document.webkitExitFullscreen ||
-              document.webkitCancelFullScreen ||
-              document.mozCancelFullScreen ||
-              document.msExitFullscreen;
-        if (!exit) {
-            return Promise.resolve();
-        }
-        try {
-            const result = exit.call(document);
-            return result && typeof result.then === 'function' ? result : Promise.resolve();
-        } catch (e) {
-            return Promise.reject(e);
-        }
-    }
-    function exitCaller() {
-        try {
-            const lines = String(new Error().stack || '').split('\n');
-            return (lines[2] || lines[1] || '?').trim().replace(/^at\s+/, '').slice(0, 140);
-        } catch (e) {
-            return '?';
-        }
-    }
-    function installExitFullscreenGuard() {
-        if (exitFullscreenGuardInstalled) {
-            return;
-        }
-        exitFullscreenGuardInstalled = true;
-        ['exitFullscreen', 'webkitExitFullscreen', 'webkitCancelFullScreen',
-         'mozCancelFullScreen', 'msExitFullscreen'].forEach(name => {
-            const original = document[name];
-            if (typeof original !== 'function') {
-                return;
-            }
-            const wrapper = function() {
-                if (rebuildFullscreenGuard > 0) {
-                    if (fsTrace) {
-                        fsTrace.blocked += 1;
-                    }
-                    dlog('[dev] 站点重建播放器 → 已拦下 document.' + name + '()，保持全屏');
-                    return Promise.resolve();
-                }
-                if (wantFullscreen && getBrowserFullscreenElement()) {
-                    throttleLog('exitfs-caller', 1000, () => {
-                        dlog('[dev] ⚠ 页面脚本主动调用 document.' + name + '()（非用户操作），来源=' + exitCaller());
-                    });
-                }
-                return original.apply(this, arguments);
+            var u = new URL(url);
+            var token = u.searchParams.get("token");
+            if (!token) return null;
+            var match = u.pathname.match(/\/live\/([^/]+)\//);
+            if (!match) return null;
+            var payload = JSON.parse(atob(token.split(".")[1]));
+            return {
+                token: token,
+                volcSecret: u.searchParams.get("volcSecret"),
+                volcTime: u.searchParams.get("volcTime"),
+                stream: match[1],
+                exp: payload.exp || 0
             };
-            wrapper.__smgOriginal = original;
-            document[name] = wrapper;
-        });
-        dlog('[dev] 全屏守卫已就位 v' +
-             ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '?') +
-             '（重建窗口内拦下站点退全屏）');
-    }
-    function adoptNativeFullscreen(component) {
-        const player = component?.player;
-        const el = getBrowserFullscreenElement();
-        if (!player || !el) {
-            return;
-        }
-        if (player.root && player.root !== el) {
-            return;
-        }
-        try {
-            player.fullscreen = true;
-            player._fullscreenEl = el;
-            if (typeof player.onFullscreenChange === 'function') {
-                player.onFullscreenChange();
-            }
         } catch (e) {
-            return;
+            return null;
         }
-        throttleLog('fs-adopt', 1500, () => {
-            dlog('[dev] 重建后仍在全屏 → 已把全屏状态同步给新播放器实例 ' + describeEl(el));
-        });
     }
-    function describeEl(el) {
-        if (!el) return 'null';
-        const cls = String(el.className || '').split(/\s+/).filter(Boolean).slice(0, 3).join('.');
-        return '<' + String(el.tagName || '?').toLowerCase() + (cls ? '.' + cls : '') + '>';
+
+    // v0.19: server shortened token TTL (seen 6min). Refresh proactively well
+    // before expiry so live playback never hits a 403 mid-stream.
+    // v0.21-fix: CDN actually enforces volcTime (iat+600s, 10min), NOT JWT exp
+    // (12h). Playwright 2026-09-12 proof: old token exp left 11.8h but volcTime
+    // left -189s → manifest 403; fresh token volcTime left 601s → 200.
+    // So validity = min(exp, volcTime) with margin.
+    var SMG_TOKEN_REFRESH_MARGIN = 120 * 1000;
+    function smgTokenMsLeft(t) {
+        if (!t || !t.exp) return 0;
+        var expLeft = t.exp * 1000 - Date.now();
+        var volcLeft = t.volcTime ? (Number(t.volcTime) * 1000 - Date.now()) : expLeft;
+        return Math.min(expLeft, volcLeft);
     }
-    function getStableFullscreenHost(component) {
-        const ref = component?.$refs?.livePlayer;
-        if (ref && ref.isConnected) {
-            return ref;
-        }
-        const el = document.querySelector(FULLSCREEN_HOST_SELECTOR);
-        if (el && el.isConnected) {
-            const root = component?.player?.root;
-            if (!root || el.contains(root) || !root.isConnected) {
-                return el;
-            }
-        }
-        return null;
+    function smgTokenValid(t) {
+        return !!t && !!t.token && (smgTokenMsLeft(t) > SMG_TOKEN_REFRESH_MARGIN);
     }
-    function getFullscreenTarget(component, button) {
-        return getStableFullscreenHost(component) ||
-            component?.player?.root ||
-            button?.closest?.('.xgplayer') ||
-            component?.$refs?.livePlayer ||
-            document.querySelector('.live-player .xgplayer, .player-box .xgplayer, .xgplayer, .live-player, .player-box');
-    }
-    function markFullscreenHost(component, target) {
-        const host = getStableFullscreenHost(component);
-        if (!host || host !== target) {
-            dlog('[dev] 全屏布局未挂容器：目标不是稳定容器 target=' + describeEl(target) +
-                 ' host=' + describeEl(host));
-            return;
-        }
-        host.classList.add(FULLSCREEN_TARGET_CLASS);
-        nativeFullscreenHost = host;
-        nativeFullscreenHostAt = Date.now();
-        dlog('[dev] 全屏布局已挂稳定容器 ' + describeEl(host) +
-             ' 含player.root=' + !!(host.querySelector && host.querySelector('.xgplayer')));
-    }
-    function clearFullscreenHost() {
-        if (nativeFullscreenHost) {
-            nativeFullscreenHost.classList.remove(FULLSCREEN_TARGET_CLASS);
-            nativeFullscreenHost = null;
-        }
-        nativeFullscreenHostAt = 0;
-    }
-    function pruneStaleFullscreenHost() {
-        if (!nativeFullscreenHost || Date.now() - nativeFullscreenHostAt < 1500) {
-            return false;
-        }
-        if (getBrowserFullscreenElement() || isFallbackFullscreen()) {
-            return false;
-        }
-        dlog('[dev] 全屏布局类残留（当前并未全屏）→ 清理 ' + describeEl(nativeFullscreenHost));
-        clearFullscreenHost();
-        return true;
-    }
-    function nudgePlayerResize(component) {
-        const player = component?.player;
-        if (!player || typeof player.resize !== 'function') {
-            return false;
-        }
+
+    // v0.36: resolve the channel the page is showing RIGHT NOW. The SPA swaps
+    // channels without a reload, so this must never be memoised at document-start.
+    function smgChannelId(vue) {
         try {
-            player.resize();
-        } catch (e) {
-            return false;
-        }
-        throttleLog('fs-resize', 1500, () => {
-            dlog('[dev] 容器全屏中重建 → 已催 xgplayer 重算尺寸');
-        });
-        return true;
-    }
-    function isIOSVideoFullscreen(component) {
-        const video = getPlayerVideo(component);
-        return !!(video && (video.webkitDisplayingFullscreen || video.webkitFullscreenElement));
-    }
-    let fsTrace = null;
-    function fsStateLabel() {
-        const el = getBrowserFullscreenElement();
-        if (el) {
-            return '真全屏(' + describeEl(el) + ')';
-        }
-        return isFallbackFullscreen() ? '网页全屏' : '非全屏';
-    }
-    function startFsTrace(tag) {
-        if (fsTrace && Date.now() - fsTrace.t0 < 5000) {
-            fsTrace.steps.push(tag);
-            return;
-        }
-        fsTrace = { t0: Date.now(), steps: [tag], start: fsStateLabel(), blocked: 0, checks: [] };
-    }
-    function noteFsTrace(text) {
-        if (fsTrace && fsTrace.checks.length < 6 && fsTrace.checks[fsTrace.checks.length - 1] !== text) {
-            fsTrace.checks.push(text);
-        }
-    }
-    function endFsTrace() {
-        if (!fsTrace || Date.now() - fsTrace.t0 < 1000) {
-            return;
-        }
-        const t = fsTrace;
-        fsTrace = null;
-        const end = fsStateLabel();
-        if (t.blocked === 0 && t.start === '非全屏' && end === '非全屏') {
-            return;
-        }
-        dlog('[dev] ★全屏轨迹 ' + t.steps.join('→') +
-             ' | 起=' + t.start +
-             ' 拦下退出=' + t.blocked +
-             (t.checks.length ? ' 检查=' + t.checks.join(',') : '') +
-             ' 末=' + end +
-             ' 意图=' + wantFullscreen +
-             ' 用时=' + Math.round(Date.now() - t.t0) + 'ms');
-    }
-    function restoreFullscreenIfNeeded(component, tag) {
-        if (!wantFullscreen) {
-            noteFsTrace('无全屏意图');
-            return;
-        }
-        if (getBrowserFullscreenElement() || isFallbackFullscreen() || isIOSVideoFullscreen(component)) {
-            adoptNativeFullscreen(component);
-            nudgePlayerResize(component);
-            noteFsTrace('仍在');
-            dlog('[dev] 重建后检查(' + tag + ')：仍在全屏（已同步给新实例）');
-            return;
-        }
-        if (fsRestoreTries >= 2) {
-            noteFsTrace('丢失·放弃');
-            dlog('[dev] 重建后检查(' + tag + ')：已尝试 ' + fsRestoreTries + ' 次仍未恢复，放弃（需手动再点全屏）');
-            return;
-        }
-        fsRestoreTries += 1;
-        noteFsTrace('丢失·恢复' + fsRestoreTries);
-        dlog('[dev] 重建后检查(' + tag + ')：全屏已丢失 → 尝试恢复 第' + fsRestoreTries + '次');
-        enterFullscreen(component, getFullscreenTarget(component, null), 'restore');
-    }
-    function syncFullscreenButtonState(component, isFullscreen) {
-        document.querySelectorAll(FULLSCREEN_BUTTON_SELECTOR).forEach(button => {
-            button.setAttribute('data-state', isFullscreen ? 'full' : 'normal');
-        });
-    }
-    function enterFallbackFullscreen(target, component) {
-        if (!target) {
-            return;
-        }
-        const player = component?.player;
-        if (player && typeof player.getCssFullscreen === 'function') {
-            try {
-                player.getCssFullscreen(target);
-                cssFullscreenFallbackPlayer = player;
-                syncFullscreenButtonState(component, true);
-                return;
-            } catch (e) {
-                console.warn('[SMGTV] xgplayer CSS 全屏失败，使用样式兜底', e);
+            if (vue && vue.currChannel && vue.currChannel.id) return String(vue.currChannel.id);
+            if (vue && vue.currChannelDetail && vue.currChannelDetail.id) {
+                return String(vue.currChannelDetail.id);
             }
-        }
-        exitFallbackFullscreen(component);
-        fullscreenFallbackTarget = target;
-        target.classList.add(FULLSCREEN_TARGET_CLASS);
-        document.body?.classList.add(FULLSCREEN_FALLBACK_CLASS);
-        syncFullscreenButtonState(component, true);
+            if (vue && vue.channelId) return String(vue.channelId);
+            var m = (location.search || "").match(/[?&]id=(\d+)/);
+            if (m) return m[1];
+        } catch (e) {}
+        return "";
     }
-    function exitFallbackFullscreen(component) {
-        const player = component?.player || cssFullscreenFallbackPlayer;
-        if (cssFullscreenFallbackPlayer && player && typeof player.exitCssFullscreen === 'function') {
-            try {
-                player.exitCssFullscreen();
-            } catch (e) {
-                console.warn('[SMGTV] 退出 xgplayer CSS 全屏失败', e);
-            }
-        }
-        cssFullscreenFallbackPlayer = null;
-        if (fullscreenFallbackTarget) {
-            fullscreenFallbackTarget.classList.remove(FULLSCREEN_TARGET_CLASS);
-            fullscreenFallbackTarget = null;
-        }
-        document.body?.classList.remove(FULLSCREEN_FALLBACK_CLASS);
-        syncFullscreenButtonState(component, false);
-    }
-    function isFallbackFullscreen() {
-        return !!document.body?.classList.contains(FULLSCREEN_FALLBACK_CLASS) ||
-            !!cssFullscreenFallbackPlayer?.cssfullscreen ||
-            !!cssFullscreenFallbackPlayer?.isCssfullScreen;
-    }
-    function callFullscreenMethod(fn) {
+
+    function smgFindDonorId(vue, fallback) {
         try {
-            const result = fn();
-            return result && typeof result.then === 'function' ? result : Promise.resolve();
-        } catch (e) {
-            return Promise.reject(e);
-        }
-    }
-    function enterNativeVideoFullscreen(component) {
-        const video = getPlayerVideo(component);
-        if (!video || typeof video.webkitEnterFullscreen !== 'function') {
-            return false;
-        }
-        try {
-            video.webkitEnterFullscreen();
-            syncFullscreenButtonState(component, true);
-            return true;
-        } catch (e) {
-            console.warn('[SMGTV] iOS 原生视频全屏失败，使用 CSS 兜底', e);
-            return false;
-        }
-    }
-    function enterFullscreen(component, target, from) {
-        const player = component?.player;
-        const usePlayerApi = !!(player && typeof player.getFullscreen === 'function');
-        const isHost = !!target && target === getStableFullscreenHost(component);
-        const activated = navigator.userActivation ? !!navigator.userActivation.isActive : true;
-        if (!activated && from === 'restore') {
-            dlog('[dev] 全屏请求 来源=restore 无用户手势 → 直接 CSS 兜底 目标=' + describeEl(target));
-            wantFullscreen = true;
-            enterFallbackFullscreen(target, component);
-            return;
-        }
-        dlog('[dev] 全屏请求 来源=' + (from || 'button') + ' 目标=' + describeEl(target) +
-             ' 稳定容器=' + isHost + ' 走=' + (usePlayerApi ? 'xgplayer.getFullscreen' : '原生requestFullscreen'));
-        const enterNative = callFullscreenMethod(() => (
-            usePlayerApi ? player.getFullscreen(target) : requestElementFullscreen(target)
-        ));
-        Promise.resolve(enterNative)
-            .then(() => {
-            wantFullscreen = true;
-            markFullscreenHost(component, target);
-            syncFullscreenButtonState(component, true);
-            dlog('[dev] 全屏成功 当前全屏元素=' + describeEl(getBrowserFullscreenElement()));
-        })
-            .catch(err => {
-            dlog('[dev] 原生全屏未成功：' + (err && err.message ? err.message : err));
-            wantFullscreen = true;
-            if (!enterNativeVideoFullscreen(component)) {
-                enterFallbackFullscreen(target, component);
-                dlog('[dev] 全屏兜底 CSS 目标=' + describeEl(target));
-            } else {
-                dlog('[dev] 全屏兜底 iOS 视频全屏');
-            }
-        });
-    }
-    function exitFullscreen(component) {
-        const player = component?.player;
-        wantFullscreen = false;
-        dlog('[dev] 退出全屏 方式=' + (isFallbackFullscreen() ? 'CSS兜底' : '原生') +
-             ' 全屏元素=' + describeEl(getBrowserFullscreenElement()));
-        clearFullscreenHost();
-        if (isFallbackFullscreen()) {
-            exitFallbackFullscreen(component);
-            return;
-        }
-        const exitNative = callFullscreenMethod(() => (
-            player && typeof player.exitFullscreen === 'function' ?
-            player.exitFullscreen() :
-            exitBrowserFullscreen()
-        ));
-        Promise.resolve(exitNative)
-            .catch(exitBrowserFullscreen)
-            .then(
-            () => syncFullscreenButtonState(component, false),
-            () => syncFullscreenButtonState(component, false)
-        );
-    }
-    function handleFullscreenControl(event) {
-        const button = event.target?.closest?.(FULLSCREEN_BUTTON_SELECTOR);
-        if (!button) {
-            return;
-        }
-        const now = Date.now();
-        if (now - lastFullscreenActionAt < 300) {
-            event.preventDefault();
-            event.stopPropagation();
-            event.stopImmediatePropagation?.();
-            return;
-        }
-        lastFullscreenActionAt = now;
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-        const component = findTVComponent();
-        const target = getFullscreenTarget(component, button);
-        const host = getStableFullscreenHost(component);
-        dlog('[dev] 点击全屏按钮 目标=' + describeEl(target) +
-             ' 稳定容器=' + describeEl(host) +
-             ' player.root=' + describeEl(component?.player?.root) +
-             ' 目标即容器=' + (!!host && target === host));
-        syncLoadingState(component);
-        const video = getPlayerVideo(component);
-        if (getBrowserFullscreenElement() || isFallbackFullscreen()) {
-            exitFullscreen(component);
-        } else if (video && video.webkitDisplayingFullscreen) {
-            try {
-                if (typeof video.webkitExitFullscreen === 'function') {
-                    video.webkitExitFullscreen();
-                }
-            } catch (e) {
-                console.warn('[SMGTV] 退出 iOS 原生全屏失败', e);
-            }
-            wantFullscreen = false;
-            syncFullscreenButtonState(component, false);
-        } else {
-            fsRestoreTries = 0;
-            enterFullscreen(component, target, 'button');
-        }
-    }
-    function handleFullscreenChange() {
-        const component = findTVComponent();
-        const el = getBrowserFullscreenElement();
-        if (el) {
-            if (isFallbackFullscreen()) {
-                exitFallbackFullscreen(component);
-            }
-            syncFullscreenButtonState(component, true);
-            wantFullscreen = true;
-            dlog('[dev] 全屏变化→进入 元素=' + describeEl(el) +
-                 ' 即挂的容器=' + (el === nativeFullscreenHost));
-            return;
-        }
-        if (isFallbackFullscreen()) {
-            return;
-        }
-        syncFullscreenButtonState(component, false);
-        clearFullscreenHost();
-        dlog('[dev] 全屏变化→退出 用户意图=' + wantFullscreen + ' 元素=' + describeEl(el) +
-             '（未经守卫拦截 → 按用户主动退出处理）');
-        wantFullscreen = false;
-        fsRestoreTries = 0;
-    }
-    function initFullscreenPatch() {
-        installExitFullscreenGuard();
-        document.addEventListener('click', handleFullscreenControl, true);
-        document.addEventListener('touchend', handleFullscreenControl, true);
-        document.addEventListener('fullscreenchange', handleFullscreenChange);
-        document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
-        document.addEventListener('mozfullscreenchange', handleFullscreenChange);
-        document.addEventListener('MSFullscreenChange', handleFullscreenChange);
-        const onEscape = event => {
-            if (event.key !== 'Escape' && event.key !== 'Esc' && event.keyCode !== 27) {
-                return;
-            }
-            if (isFallbackFullscreen()) {
-                exitFallbackFullscreen(findTVComponent());
-            }
-            if (wantFullscreen) {
-                wantFullscreen = false;
-                clearFullscreenHost();
-                noteFsTrace('Esc');
-                dlog('[dev] Esc 退出全屏 → 清除全屏意图');
-            }
-        };
-        window.addEventListener('keydown', onEscape, true);
-    }
-    const REBUILD_DESTROYS_PLAYER = ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer'];
-    function wrapComponentMethod(component, methodName, after) {
-        const original = component?.[methodName];
-        if (typeof original !== 'function' || original.__smgWrapped) {
-            return;
-        }
-        const wrapped = function() {
-            if (methodName !== 'getProgramDetail') {
-                startFsTrace(methodName);
-            }
-            if (DEV_LOG && (methodName === 'initPlayer' || methodName === 'changeProgram')) {
-                const a0 = arguments[0] || {};
-                dlog('[dev] ' + methodName + ' 进入', 'url=' + (typeof a0.url === 'string' ? (a0.url || '(空)') : '-'),
-                     'isLive=' + a0.isLive, 'prog=' + (this.programObj?.name ? String(this.programObj.name).slice(0, 12) : '-'));
-            }
-            const programId = this.programObj?.id;
-            if (programId && programId !== this.__smgRecoverProgramId) {
-                this.__smgRecoverProgramId = programId;
-                this.__smgRecoverCount = 0;
-                this.__smgRenewedExp = 0;
-                clearResumePosition(this);
-            }
-            ensurePlayableStream(this);
-            if (methodName !== 'getProgramDetail') {
-                this.__smgRebuildAt = Date.now();
-                fsRestoreTries = 0;
-            }
-            const holdsFullscreen = REBUILD_DESTROYS_PLAYER.indexOf(methodName) >= 0;
-            if (holdsFullscreen) {
-                rebuildFullscreenGuard += 1;
-            }
-            let result;
-            try {
-                result = original.apply(this, arguments);
-            } finally {
-                if (holdsFullscreen) {
-                    rebuildFullscreenGuard -= 1;
+            var lists = [vue.programList, vue.currentProgramList, vue.playingProgramList];
+            for (var i = 0; i < lists.length; i++) {
+                var arr = lists[i];
+                if (!Array.isArray(arr)) continue;
+                for (var j = 0; j < arr.length; j++) {
+                    if (arr[j] && arr[j].is_review === 1 && arr[j].id) return arr[j].id;
                 }
             }
-            const runAfter = () => {
-                ensurePlayableStream(this);
-                setTimeout(() => after(this, 0), 0);
-                setTimeout(() => after(this, 250), 250);
-                setTimeout(() => after(this, 1000), 1000);
-            };
-            if (result && typeof result.then === 'function') {
-                result.then(runAfter, runAfter);
-            } else {
-                runAfter();
-            }
-            return result;
-        };
-        wrapped.__smgWrapped = true;
-        wrapped.__smgOriginal = original;
-        component[methodName] = wrapped;
+        } catch (e) {}
+        return fallback || 0;
     }
-    function patchComponent(component) {
-        if (!component) {
+
+    function smgDateStr(offsetDays) {
+        var d = new Date(Date.now() - offsetDays * 86400000);
+        var mm = ("0" + (d.getMonth() + 1)).slice(-2);
+        var dd = ("0" + d.getDate()).slice(-2);
+        return d.getFullYear() + "-" + mm + "-" + dd;
+    }
+
+    // v0.20: guard against concurrent bootstrap calls trampling each other.
+    // initPlayer can fire multiple times (page load + program switch); without
+    // this, two overlapping scans share _scanOffset and neither reaches yesterday.
+    var _smgTokenPending = null;
+    function smgEnsureToken(vue, cb) {
+        // v0.36: everything below is scoped to the channel that is on screen.
+        var cid = smgChannelId(vue);
+        var conf = SMG_CHANNEL_MAP[cid];
+        if (!conf) {
+            // No mapping (ch4 another CDN, ch11/ch12 no reviewable program, or an
+            // unknown id): never invent a stream, let the site's own player run.
+            console.log("[SMGTV] [Token] channel " + (cid || "?") +
+                " not handled by this script — leaving the site player alone");
+            cb(null);
             return;
         }
-        startLoadingMonitor(component);
-        if (component.__smgPatched) {
-            syncLoadingState(component);
+        if (_smgTokenChannel !== cid) {
+            _smgTokenCache = null;
+            _smgTokenChannel = cid;
+        }
+        if (smgTokenValid(_smgTokenCache)) {
+            cb(_smgTokenCache);
             return;
         }
-        component.__smgPatched = true;
-        if (typeof component.countdown === 'number') {
-            component.countdown = 99999999;
+        if (_smgTokenPending && _smgTokenPending.cid === cid) {
+            _smgTokenPending.cbs.push(cb);
+            return;
         }
-        component.showOpenApp = false;
-        component.showFlag = false;
-        component.startCountdown = function() {};
-        if (component.liveTimer) {
-            clearTimeout(component.liveTimer);
-            component.liveTimer = null;
+        _smgTokenPending = { cid: cid, cbs: [cb] };
+        function done(t) {
+            var pending = _smgTokenPending;
+            _smgTokenPending = null;
+            var cbs = (pending && pending.cbs) || [];
+            for (var i = 0; i < cbs.length; i++) {
+                try { cbs[i](t); } catch (e) {}
+            }
         }
-        if (!component.player && component.programObj?.id && typeof component.playProgram === 'function') {
-            component.playProgram();
+        // Candidate donor IDs: this channel's known-good history first, then
+        // whatever the page exposes, then a day-by-day backward scan of THIS
+        // channel's programs (SMG_DONOR_SCAN_DAYS). Only is_review=1 programs
+        // carry a shift_address, so the scan only queues those.
+        var tried = {};
+        var queue = [];
+        function enqueue(id) {
+            if (id && !tried[id] && queue.indexOf(id) === -1) queue.push(id);
         }
-        if (typeof component.pageVisibilityChange === 'function') {
-            document.removeEventListener('visibilitychange', component.pageVisibilityChange);
-            component.pageVisibilityChange = function() {};
-            document.addEventListener('visibilitychange', component.pageVisibilityChange);
-        }
-        if (component._handlerUnload) {
-            UW.removeEventListener('unload', component._handlerUnload);
-            component._handlerUnload = null;
-        }
-        ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel', 'getProgramDetail'].forEach(methodName => {
-            wrapComponentMethod(component, methodName, function (comp, tick) {
-                syncLoadingState(comp);
-                if (methodName !== 'getProgramDetail') {
-                    restoreFullscreenIfNeeded(comp, methodName + '+' +
-                        Math.round(Date.now() - (comp.__smgRebuildAt || Date.now())) + 'ms');
-                    if (tick === 1000) {
-                        endFsTrace();
+        for (var i = 0; i < conf.donors.length; i++) enqueue(conf.donors[i]);
+        enqueue(smgFindDonorId(vue, conf.donors[0]));
+        console.log("[SMGTV] [Token] channel " + cid + " (" + conf.stream +
+            ") donor queue:", queue.join(","));
+        function scanDay(offset, done) {
+            if (offset >= SMG_DONOR_SCAN_DAYS) {
+                done();
+                return;
+            }
+            var dateStr = smgDateStr(offset);
+            console.log("[SMGTV] [Token] scanning ch" + cid + " programs:", dateStr);
+            smgApiGet("/content/pc/tv/programs", { channel_id: Number(cid), date: dateStr }).then(function(data) {
+                var list = (data && data.result && data.result.programs) || [];
+                var added = 0;
+                for (var j = 0; j < list.length; j++) {
+                    if (list[j] && list[j].is_review === 1 && list[j].id &&
+                        tried[list[j].id] === undefined && queue.indexOf(list[j].id) === -1) {
+                        queue.push(list[j].id);
+                        added++;
                     }
                 }
+                console.log("[SMGTV] [Token] scan " + dateStr + ": +" + added + " donors");
+                done();
+            }).catch(function(e) {
+                console.warn("[SMGTV] [Token] scan failed for " + dateStr + ":",
+                    e && e.message);
+                done();
             });
-        });
-        installReplayUrlPatch(component);
-        wrapMobileInitPlayer(component);
-        ensurePlayableStream(component);
-        const handleProgramList = component.handleProgramList;
-        if (typeof handleProgramList === 'function' && !handleProgramList.__smgWrapped) {
-            const wrappedList = function(...args) {
-                const result = handleProgramList.apply(this, args);
-                if (Array.isArray(result)) {
-                    result.forEach(program => forceOpenProgram(program));
-                }
-                return result;
-            };
-            wrappedList.__smgWrapped = true;
-            component.handleProgramList = wrappedList;
         }
-        forceOpenProgramList(component);
-        syncLoadingState(component);
-        if (component.player && !component.player.config?.isPad && component.programObj?.play === 0) {
-            const playerUrl = component.player?.config?.url || '';
-            if (!/\bstart=\d/.test(playerUrl)) {
-                component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'auto' });
-            }
-        }
-    }
-    let scanning = false;
-    function initComponentPatch() {
-        if (scanning) {
-            return;
-        }
-        scanning = true;
-        let attempts = 0;
-        const maxAttempts = 50;
-        const timer = setInterval(() => {
-            const component = findTVComponent();
-            if (component) {
-                clearInterval(timer);
-                scanning = false;
-                patchComponent(component);
+        // v0.20: scanOffset is a per-call closure variable, NOT a static.
+        // Start at 1 (yesterday): today's reviewable program usually hasn't
+        // aired yet (empty shift_address), scanning it first wastes 2 requests.
+        var scanOffset = 1;
+        var startTime = Date.now();
+        var TIMEOUT_MS = 30000;
+        function tryNext() {
+            if (Date.now() - startTime > TIMEOUT_MS) {
+                console.error("[SMGTV] [Token] bootstrap timed out after 30s");
+                done(null);
                 return;
             }
-            attempts += 1;
-            if (attempts >= maxAttempts) {
-                clearInterval(timer);
-                scanning = false;
-                console.warn('[SMGTV] 未找到播放器组件实例');
-                dlogComponentDiag();
-            }
-        }, 200);
-    }
-    injectStyle(`
-    .video-tip {
-        display: none !important;
-    }
-    body.${VIDEO_READY_CLASS} .loading-mask {
-        display: none !important;
-        pointer-events: none !important;
-    }
-    body.${FULLSCREEN_FALLBACK_CLASS} {
-        overflow: hidden !important;
-    }
-    .${FULLSCREEN_TARGET_CLASS} {
-        background: #000 !important;
-        bottom: 0 !important;
-        box-sizing: border-box !important;
-        height: 100vh !important;
-        height: 100dvh !important;
-        inset: 0 !important;
-        left: 0 !important;
-        margin: 0 !important;
-        max-height: none !important;
-        max-width: none !important;
-        min-height: 100vh !important;
-        min-height: 100dvh !important;
-        min-width: 100vw !important;
-        min-width: 100dvw !important;
-        padding: 0 !important;
-        position: fixed !important;
-        right: 0 !important;
-        top: 0 !important;
-        transform: none !important;
-        width: 100vw !important;
-        width: 100dvw !important;
-        z-index: 2147483647 !important;
-    }
-    .${FULLSCREEN_TARGET_CLASS}.xgplayer,
-    .${FULLSCREEN_TARGET_CLASS} .xgplayer {
-        height: 100% !important;
-        inset: 0 !important;
-        margin: 0 !important;
-        max-height: none !important;
-        max-width: none !important;
-        padding: 0 !important;
-        padding-top: 0 !important;
-        position: absolute !important;
-        transform: none !important;
-        width: 100% !important;
-    }
-    .${FULLSCREEN_TARGET_CLASS} .xgplayer-screen-container,
-    .${FULLSCREEN_TARGET_CLASS} xg-video-container.xg-video-container,
-    .${FULLSCREEN_TARGET_CLASS} .xg-video-container {
-        bottom: 0 !important;
-        display: block !important;
-        height: 100% !important;
-        inset: 0 !important;
-        position: absolute !important;
-        width: 100% !important;
-    }
-    .${FULLSCREEN_TARGET_CLASS} video,
-    .${FULLSCREEN_TARGET_CLASS} canvas,
-    .${FULLSCREEN_TARGET_CLASS} live-video {
-        bottom: 0 !important;
-        height: 100% !important;
-        left: 0 !important;
-        max-height: none !important;
-        max-width: none !important;
-        object-fit: contain !important;
-        position: absolute !important;
-        right: 0 !important;
-        top: 0 !important;
-        transform: none !important;
-        width: 100% !important;
-    }
-    .${FULLSCREEN_TARGET_CLASS} .xgplayer-controls,
-    .${FULLSCREEN_TARGET_CLASS} .xg-top-bar {
-        z-index: 2147483647 !important;
-    }
-    .${FULLSCREEN_TARGET_CLASS} .xgplayer-controls {
-        padding-bottom: env(safe-area-inset-bottom, 0px) !important;
-    }
-    .${FULLSCREEN_TARGET_CLASS} .xg-top-bar {
-        padding-top: env(safe-area-inset-top, 0px) !important;
-    }
-    `);
-const originalOpen = UW.XMLHttpRequest.prototype.open;
-function isTargetTVApi(url) {
-    try {
-        return new URL(String(url), location.href).pathname.includes('/content/pc/tv/');
-    } catch (e) {
-        return String(url).includes('/content/pc/tv/');
-    }
-}
-function rewriteTvApiResponse(requestUrl, response) {
-    let modified = false;
-    if (!response || typeof response !== 'object') {
-        return false;
-    }
-    if (requestUrl.includes('/channel/detail') && response.result) {
-        rememberStreamAddresses(
-            response.result.id,
-            response.result.live_address,
-            response.result.shift_address
-        );
-    }
-    if (requestUrl.includes('/program/detail') && response.result) {
-        rememberServerProgramFlags(response.result);
-        forceOpenProgram(response.result);
-        const channelInfo = response.result.channel_info || (response.result.channel_info = {});
-        const channelId = getResultChannelId(response.result);
-        fillStreamAddresses(channelInfo, channelId);
-        modified = true;
-    }
-    if (requestUrl.includes('/programs') && response.result?.programs) {
-        response.result.programs.forEach(program => {
-            rememberServerProgramFlags(program);
-            forceOpenProgram(program);
-            modified = true;
-        });
-    }
-    return modified;
-}
-function replaceXhrResponse(xhr, body) {
-    try {
-        Object.defineProperty(xhr, 'responseText', {
-            value: body,
-            writable: false,
-            configurable: true
-        });
-        Object.defineProperty(xhr, 'response', {
-            value: xhr.responseType === 'json' ? JSON.parse(body) : body,
-            writable: false,
-            configurable: true
-        });
-    } catch (e) {
-        throttleLog('rewrite-error', 5000, () => console.error('[SMGTV] 重写接口响应失败:', e));
-    }
-}
-UW.XMLHttpRequest.prototype.open = function(method, url) {
-    this.__smgRequestUrl = String(url);
-    if (isTargetTVApi(this.__smgRequestUrl)) {
-        if (!this.__smgHooked) {
-            this.__smgHooked = true;
-            this.addEventListener('readystatechange', function() {
-                if (this.readyState !== 4) {
-                    return;
-                }
-                const requestUrl = this.__smgRequestUrl;
-                try {
-                    let response;
-                    let rawText = null;
-                    try {
-                        rawText = this.responseText;
-                    } catch (e) {
-                        rawText = null;
-                    }
-                    if (typeof rawText === 'string' && rawText) {
-                        response = JSON.parse(rawText);
-                    } else if (this.response && typeof this.response === 'object') {
-                        response = this.response;
-                    } else {
+            if (!queue.length) {
+                // No candidates left — scan one more day back, then retry.
+                scanDay(scanOffset, function() {
+                    scanOffset++;
+                    if (!queue.length && scanOffset > SMG_DONOR_SCAN_DAYS) {
+                        console.error("[SMGTV] [Token] bootstrap failed: all donors empty");
+                        done(null);
                         return;
                     }
-                    if (rewriteTvApiResponse(requestUrl, response)) {
-                        replaceXhrResponse(this, JSON.stringify(response));
+                    if (!queue.length) {
+                        tryNext();
+                        return;
                     }
-                } catch (e) {
-                    throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
+                    tryNext();
+                });
+                return;
+            }
+            var donorId = queue.shift();
+            if (tried[donorId]) {
+                tryNext();
+                return;
+            }
+            tried[donorId] = true;
+            console.log("[SMGTV] [Token] fetching donor program/detail:", donorId);
+            smgApiGet("/content/pc/tv/program/detail", { channel_program_id: donorId }).then(function(data) {
+                var res = (data && data.result) || {};
+                var enc = res.channel_info && res.channel_info.shift_address;
+                if (!enc && res.channel_info && res.channel_info.live_address) {
+                    enc = res.channel_info.live_address;
                 }
+                if (!enc) {
+                    console.warn("[SMGTV] [Token] donor empty, trying next (id=" + donorId + ")");
+                    tryNext();
+                    return;
+                }
+                var plain = smgRsaDecrypt(enc);
+                if (!plain) throw new Error("donor decrypt failed (id=" + donorId + ")");
+                var t = smgTokenFromUrl(plain);
+                if (!t) throw new Error("donor URL parse failed (id=" + donorId + ")");
+                if (conf.stream && t.stream !== conf.stream) {
+                    console.warn("[SMGTV] [Token] donor " + donorId + " mints stream " +
+                        t.stream + ", this channel is " + conf.stream + " — skipping");
+                    tryNext();
+                    return;
+                }
+                _smgTokenCache = t;
+                _smgTokenChannel = cid;
+                if (conf.donors.indexOf(donorId) === -1) conf.donors.unshift(donorId);
+                console.log("[SMGTV] [Token] ready via donor " + donorId +
+                    ", channel=" + cid + " stream=" + t.stream,
+                    "exp=" + new Date(t.exp * 1000).toLocaleString());
+                done(t);
+            }).catch(function(e) {
+                console.warn("[SMGTV] [Token] donor error, trying next:",
+                    e && e.message);
+                tryNext();
             });
         }
+        tryNext();
     }
-    return originalOpen.apply(this, arguments);
-};
-const originalFetch = RAW_FETCH;
-if (typeof originalFetch === 'function') {
-    UW.fetch = function(input, init) {
-        const requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
-        const request = originalFetch.apply(this, arguments);
-        if (!isTargetTVApi(requestUrl)) {
-            return request;
+
+    function smgBuildShiftUrl(t, startTime) {
+        if (!t) return null;
+        return "https://volc-stream.kksmg.com/live/" + t.stream +
+            "/index.m3u8?token=" + t.token +
+            "&volcSecret=" + t.volcSecret +
+            "&volcTime=" + t.volcTime +
+            "&startTime=" + startTime;
+    }
+
+    // ===== v0.33 ROOT CAUSE FIX: live must use the BARE URL, not startTime =====
+    // Playwright 2026-10-23, same donor token, both fetched from the page:
+    //   bare                      → 200, #EXT-X-VERSION:3, 5 segments,
+    //                               MEDIA-SEQUENCE 1791969262 advancing every 10s
+    //   ...&startTime=now-30      → 200, #EXT-X-VERSION:6, 3 segments,
+    //                               MEDIA-SEQUENCE 1792109490 FROZEN per startTime
+    // The CDN serves two different playlist modes:
+    //   • no startTime  → real LIVE playlist, server-side sliding window (V3)
+    //   • startTime=…   → time-SHIFT/DVR playlist, fixed ~30s per request (V6)
+    // v0.25 moved live to startTime because bare returned 403 on that day's token,
+    // but a live player then only ever sees a 30s frozen window — it plays 30s
+    // and stops, which is exactly the stall users report ([Mon] dT=0, rs=2,
+    // full buffer, no error, no 403). The page's own player has always used the
+    // bare URL and keeps playing — that is the proof this is the right mode.
+    // (The V6 poll also freezes its URL inside hls._pollM3U8's closure, so the
+    // old "slide the stored URL" trick could never work — see the loader hook.)
+    function smgBuildLiveUrl(t) {
+        if (!t) return null;
+        // Fallback (see _smgLiveShiftMode): if the bare playlist ever gets
+        // rejected with 403 again, fall back to the time-shift form. The loader
+        // hook rewrites its startTime on every poll, so that mode still advances.
+        if (_smgLiveShiftMode) return smgBuildLiveShiftUrl(t);
+        return "https://volc-stream.kksmg.com/live/" + t.stream +
+            "/index.m3u8?token=" + t.token +
+            "&volcSecret=" + t.volcSecret +
+            "&volcTime=" + t.volcTime;
+    }
+
+    // Time-shift variant (fixed ~30s window per startTime, #EXT-X-VERSION:6).
+    // Kept ONLY as the 403 fallback for live; replay always uses this form.
+    function smgBuildLiveShiftUrl(t) {
+        if (!t) return null;
+        return "https://volc-stream.kksmg.com/live/" + t.stream +
+            "/index.m3u8?token=" + t.token +
+            "&volcSecret=" + t.volcSecret +
+            "&volcTime=" + t.volcTime +
+            "&startTime=" + (Math.floor(Date.now() / 1000) - 30);
+    }
+
+    // v0.19: live watchdog — refresh token + switchURL before expiry, and
+    // v0.21: added manifest-403 counting. The old watchdog only watched the
+    // token clock and video.error — but a fresh token can ALSO 403 (IP drift),
+    // in which case HLS retries the same dead URL forever while video.error
+    // stays empty. Counting manifest 403s catches that case.
+    var _smgWatchdogTimer = null;
+    var _smgManifest403 = 0;
+    // v0.23-fix: one rejected manifestLoader.load already represents xgplayer's
+    // internal 3 retries against the SAME dead URL (originError.retryCount=3),
+    // and the player gives up after a few loads — so a threshold of 3 is never
+    // reached. A manifest 403 means the URL was rejected, retrying is pointless:
+    // refresh on the FIRST one.
+    // v0.33: live prefers the bare (natively sliding) playlist; this flag flips
+    // to the time-shift form if the CDN rejects the bare one with 403.
+    var _smgLiveShiftMode = false;
+    var SMG_MANIFEST_403_LIMIT = 1;
+    var _smgManifest403Timer = null;
+    // v0.22: xgplayer wraps the HLS error. The real HTTP status lives at
+    // err.ext.httpCode (confirmed on the live site: errorCode 2100,
+    // errorType 'network', ext.httpCode 403) — NOT err.code/err.response.
+    function smgIs403(err) {
+        try {
+            if (!err) return false;
+            if (err.ext && err.ext.httpCode === 403) return true;
+            if (err.code === 403) return true;
+            if (err.response && err.response.code === 403) return true;
+            var msg = "" + (err.message || err.errorMessage || err || "");
+            return msg.indexOf("403") !== -1;
+        } catch (e) {
+            return false;
         }
-        return request.then(res => {
-            if (!res) {
-                return res;
-            }
+    }
+    function smgNoteManifest403() {
+        _smgManifest403++;
+        if (_smgManifest403Timer) clearTimeout(_smgManifest403Timer);
+        var self = this;
+        // Decay: isolated 403s (network flake) shouldn't accumulate forever.
+        _smgManifest403Timer = setTimeout(function() {
+            _smgManifest403 = 0;
+            _smgManifest403Timer = null;
+        }, 60000);
+    }
+    // v0.32: stall detector state. [Mon] proved the stall signature:
+    // dCt=0 + rs=2 + buf full + err=- + m403=0 — HLS thinks the VOD is over
+    // (3 segs consumed, no new manifest applied). Track consecutive stalled
+    // seconds; at threshold, switchURL to a fresh startTime window.
+    var _smgStallSecs = 0;
+    function smgStartLiveWatchdog(vue, player, getUrl) {
+        smgStopLiveWatchdog();
+        var failures = 0;
+        _smgManifest403 = 0;
+        _smgStallSecs = 0;
+        _smgWatchdogTimer = setInterval(function() {
             try {
-                return res.clone().text().then(raw => {
-                    try {
-                        const response = JSON.parse(raw);
-                        if (!rewriteTvApiResponse(requestUrl, response)) {
-                            return res;
-                        }
-                        return new UW.Response(JSON.stringify(response), {
-                            status: res.status,
-                            statusText: res.statusText,
-                            headers: res.headers
-                        });
-                    } catch (e) {
-                        throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
-                        return res;
+                if (!vue.player || vue.player !== player) {
+                    smgStopLiveWatchdog();
+                    return;
+                }
+                // Stall check FIRST (every 30s tick): if video time hasn't
+                // advanced but HLS reports no error, the manifest window is
+                // stale — force a window refresh via switchURL.
+                try {
+                    var _vd = player.video;
+                    var _ct = _vd ? _vd.currentTime : -1;
+                    if (_smgLastCt !== null && _vd && !_vd.error && !_vd.paused &&
+                        _vd.readyState >= 2 && _ct === _smgLastCt) {
+                        _smgStallSecs += 30;
+                    } else if (_ct !== _smgLastCt) {
+                        _smgStallSecs = 0;
                     }
-                }).catch(() => res);
+                    if (_smgStallSecs >= 30 && _vd && !_vd.error) {
+                        console.warn("[SMGTV] [Live] STALL detected (ct frozen at " +
+                            _ct.toFixed(1) + "s)");
+                        _smgStallSecs = 0;
+                        // v0.33: cheapest recovery first — if the playlist poll
+                        // loop died, re-arm it (keeps buffer + position). Only
+                        // fall back to a full switchURL if the loop was alive.
+                        if (smgRearmLivePoll(player)) {
+                            console.log("[SMGTV] [Live] stall recovery: poll re-armed (no rebuild)");
+                            return;
+                        }
+                        console.warn("[SMGTV] [Live] poll alive but window stale — switchURL");
+                        smgEnsureToken(vue, function(t) {
+                            if (!t || !vue.player || vue.player !== player) return;
+                            var url = getUrl(t);
+                            if (!url || typeof player.switchURL !== "function") return;
+                            try {
+                                Promise.resolve(player.switchURL(url, { seamless: false, currentTime: 0 }))
+                                    .then(function() {
+                                        if (player.paused) { try { player.play(); } catch (e) {} }
+                                        console.log("[SMGTV] [Live] stall-recovery switch done");
+                                    })
+                                    .catch(function(e) {
+                                        console.error("[SMGTV] [Live] stall-recovery failed:", e && e.message);
+                                    });
+                            } catch (e) {}
+                        });
+                        return;
+                    }
+                } catch (e) {}
+                var left = smgTokenMsLeft(_smgTokenCache);
+                // v0.21: trigger on EITHER expiring token OR repeated manifest 403.
+                var needRefresh = left < SMG_TOKEN_REFRESH_MARGIN;
+                if (_smgManifest403 >= SMG_MANIFEST_403_LIMIT) {
+                    console.warn("[SMGTV] [Live] manifest 403 x" + _smgManifest403 +
+                        ", forcing token refresh (token still has " +
+                        Math.max(0, Math.round(left / 1000)) + "s left — likely IP drift)");
+                    // v0.33: a 403 on the BARE playlist means this token/route only
+                    // accepts the time-shift form — flip modes permanently and
+                    // rebuild with a startTime URL (loader rewrite keeps it moving).
+                    if (!_smgLiveShiftMode) {
+                        _smgLiveShiftMode = true;
+                        console.warn("[SMGTV] [Live] bare playlist rejected → switching live to time-shift mode");
+                    }
+                    needRefresh = true;
+                    _smgManifest403 = 0;
+                }
+                // v0.31: slide the live window EVERY tick, not only on token
+                // refresh. The CDN's VERSION:6 manifest only covers ~30s per
+                // startTime; without sliding, playback stalls at ~30s even
+                // with a perfectly valid token (proven 2026-10-23: ct froze at
+                // 29.9, buf full, no error, no 403).
+                smgSlideLiveWindow(player);
+                if (needRefresh) {
+                    console.log("[SMGTV] [Live] token expiring in " + Math.max(0, Math.round(left / 1000)) +
+                        "s, refreshing...");
+                    _smgTokenCache = null;
+                    smgEnsureToken(vue, function(t) {
+                        if (!t || !vue.player || vue.player !== player) return;
+                        var url = getUrl(t);
+                        if (!url || typeof player.switchURL !== "function") return;
+                        console.log("[SMGTV] [Live] switching to fresh token URL");
+                        try {
+                            Promise.resolve(player.switchURL(url, { seamless: false, currentTime: 0 }))
+                                .then(function() {
+                                    failures = 0;
+                                    _smgManifest403 = 0;
+                                    if (player.paused) { try { player.play(); } catch (e) {} }
+                                    console.log("[SMGTV] [Live] token refresh done");
+                                })
+                                .catch(function(e) {
+                                    console.error("[SMGTV] [Live] token refresh failed:", e && e.message);
+                                });
+                        } catch (e) {
+                            console.error("[SMGTV] [Live] switchURL threw:", e && e.message);
+                        }
+                    });
+                    return;
+                }
+                // v0.27: media error 4 is a decode/remux failure (wxty TS
+                // timestamps trip the remuxer), NOT a token problem. Refreshing
+                // the token never fixes it and just burns the token. Rebuild the
+                // player instead so transmux restarts past the bad packet.
+                // v0.31: clear _smgLastBuiltKey so the rebuild is not skipped
+                // by the already-built guard.
+                var vd = player.video;
+                if (vd && vd.error && vd.error.code === 4 && failures < 2) {
+                    failures++;
+                    console.warn("[SMGTV] [Live] media error 4, rebuilding player (attempt " + failures + ", token kept)");
+                    try {
+                        if (vue.player === player) {
+                            vue.destroyPlayer();
+                            vue.player = null;
+                        }
+                    } catch (e) {}
+                    _smgInitInFlight = null;
+                    _smgLastBuiltKey = null;
+                    try { vue.initPlayer(); } catch (e) {
+                        console.error("[SMGTV] [Live] rebuild failed:", e && e.message);
+                    }
+                } else if (vd && !vd.error) {
+                    failures = 0;
+                }
             } catch (e) {
-                throttleLog('rewrite-error', 5000, () => console.error('[SMGTV] 重写接口响应失败:', e));
-                return res;
+                console.warn("[SMGTV] [Live] watchdog tick failed:", e && e.message);
             }
+        }, 30000);
+        console.log("[SMGTV] [Live] watchdog started (30s tick)");
+    }
+    function smgStopLiveWatchdog() {
+        if (_smgWatchdogTimer) {
+            clearInterval(_smgWatchdogTimer);
+            _smgWatchdogTimer = null;
+        }
+        if (_smgMonitorTimer) {
+            clearInterval(_smgMonitorTimer);
+            _smgMonitorTimer = null;
+        }
+        if (_smgHookTimer) {
+            clearInterval(_smgHookTimer);
+            _smgHookTimer = null;
+        }
+    }
+    // v0.28: per-second playback monitor. Logs one line per second while a
+    // player exists: wall time, paused, currentTime (+delta vs last tick),
+    // readyState, buffered end, video.error, token seconds left, manifest-403
+    // count. This is what finally shows WHERE a stall happens — the 30s
+    // watchdog only sees snapshots, this shows the exact second it freezes.
+    var _smgMonitorTimer = null;
+    var _smgLastCt = null;
+    var _smgLastTick = 0;
+    function smgStartMonitor(vue, player, tag) {
+        if (_smgMonitorTimer) clearInterval(_smgMonitorTimer);
+        _smgLastCt = null;
+        _smgLastTick = Date.now();
+        _smgMonitorTimer = setInterval(function() {
+            try {
+                if (!vue.player || vue.player !== player) {
+                    clearInterval(_smgMonitorTimer);
+                    _smgMonitorTimer = null;
+                    return;
+                }
+                var now = Date.now();
+                var vd = player.video;
+                var ct = vd ? vd.currentTime : -1;
+                var dCt = (_smgLastCt === null) ? 0 : (ct - _smgLastCt);
+                _smgLastCt = ct;
+                var bufEnd = -1;
+                try {
+                    if (vd && vd.buffered && vd.buffered.length) {
+                        bufEnd = vd.buffered.end(vd.buffered.length - 1);
+                    }
+                } catch (e) {}
+                var err = (vd && vd.error) ? (vd.error.code + "/" + (vd.error.message || "").slice(0, 40)) : "-";
+                var left = Math.max(0, Math.round(smgTokenMsLeft(_smgTokenCache) / 1000));
+                console.log("[SMGTV] [Mon][" + tag + "] t+" + Math.round((now - _smgLastTick) / 1000) +
+                    "s paused=" + (vd ? vd.paused : "?") +
+                    " ct=" + (typeof ct === "number" ? ct.toFixed(1) : ct) +
+                    " dCt=" + dCt.toFixed(1) +
+                    " rs=" + (vd ? vd.readyState : "?") +
+                    " buf=" + (typeof bufEnd === "number" ? bufEnd.toFixed(1) : bufEnd) +
+                    " err=" + err +
+                    " tokLeft=" + left + "s m403=" + _smgManifest403);
+            } catch (e) {}
+        }, 1000);
+        console.log("[SMGTV] [Mon] per-second monitor started (" + tag + ")");
+    }
+    // v0.22: replay watchdog. Replay streams use the SAME 10-min volcTime token
+    // as live, but a program can run 40-90 min. Without refresh the token expires
+    // mid-playback → manifest 403 → HLS gives up → "网络错误 请试试刷新" black
+    // screen (observed at ~09:03 into an 85-min replay). This refreshes the token
+    // and re-issues the shift URL at the current program position.
+    function smgStartReplayWatchdog(vue, player, getPos) {
+        smgStopLiveWatchdog();
+        _smgManifest403 = 0;
+        var err4fails = 0;
+        _smgWatchdogTimer = setInterval(function() {
+            try {
+                if (!vue.player || vue.player !== player) {
+                    smgStopLiveWatchdog();
+                    return;
+                }
+                // v0.27: same as live — error 4 is decode/remux, not token.
+                // Rebuild the player instead of burning the token.
+                // v0.31: clear _smgLastBuiltKey so the rebuild is not skipped.
+                var vd = player.video;
+                if (vd && vd.error && vd.error.code === 4) {
+                    if (err4fails < 2) {
+                        err4fails++;
+                        console.warn("[SMGTV] [Replay] media error 4, rebuilding player (attempt " + err4fails + ", token kept)");
+                        try {
+                            if (vue.player === player) {
+                                vue.destroyPlayer();
+                                vue.player = null;
+                            }
+                        } catch (e) {}
+                        _smgInitInFlight = null;
+                        _smgLastBuiltKey = null;
+                        try { vue.initPlayer(); } catch (e) {
+                            console.error("[SMGTV] [Replay] rebuild failed:", e && e.message);
+                        }
+                    }
+                    return;
+                } else if (vd && !vd.error) {
+                    err4fails = 0;
+                }
+                var left = smgTokenMsLeft(_smgTokenCache);
+                var needRefresh = left < SMG_TOKEN_REFRESH_MARGIN;
+                if (_smgManifest403 >= SMG_MANIFEST_403_LIMIT) {
+                    console.warn("[SMGTV] [Replay] manifest 403 x" + _smgManifest403 +
+                        ", forcing token refresh (token still has " +
+                        Math.max(0, Math.round(left / 1000)) + "s left)");
+                    needRefresh = true;
+                    _smgManifest403 = 0;
+                }
+                if (!needRefresh) return;
+                console.log("[SMGTV] [Replay] token expiring in " + Math.max(0, Math.round(left / 1000)) +
+                    "s, refreshing...");
+                _smgTokenCache = null;
+                smgEnsureToken(vue, function(t) {
+                    if (!t || vue.player !== player) return;
+                    var at = getPos && getPos();
+                    if (!at) return;
+                    var url = smgBuildShiftUrl(t, Math.floor(at.start + at.pos));
+                    if (!url || typeof player.switchURL !== "function") return;
+                    console.log("[SMGTV] [Replay] re-issuing shift URL at pos=" +
+                        Math.round(at.pos) + "s");
+                    try {
+                        Promise.resolve(player.switchURL(url, { seamless: false, currentTime: 0 }))
+                            .then(function() {
+                                _smgManifest403 = 0;
+                                if (player.paused) { try { player.play(); } catch (e) {} }
+                                console.log("[SMGTV] [Replay] token refresh done");
+                            })
+                            .catch(function(e) {
+                                console.error("[SMGTV] [Replay] refresh switchURL failed:", e && e.message);
+                            });
+                    } catch (e) {
+                        console.error("[SMGTV] [Replay] switchURL threw:", e && e.message);
+                    }
+                });
+            } catch (e) {
+                console.warn("[SMGTV] [Replay] watchdog tick failed:", e && e.message);
+            }
+        }, 30000);
+        console.log("[SMGTV] [Replay] watchdog started (30s tick, token refresh)");
+    }
+    // v0.21: live manifest 403 counter. Hooks HLS manifestLoader.load and
+    // counts failures whose status is 403 — the watchdog then forces a token
+    // refresh even when the token clock still looks healthy (IP drift case).
+    // v0.29: ALSO rewrites startTime on every poll. The CDN's VERSION:6 shift
+    // manifest only returns ~30s per startTime; without rewriting, HLS keeps
+    // polling the same fixed window and stalls at ~30s (ct freezes, buf drains,
+    // no error — exactly what [Mon] showed: dCt=0, buf 30→0, err=-).
+    // v0.31: rewrite HLS's STORED manifest URL, not just the load() argument.
+    // Proven 2026-10-23: wrapping load() is not enough — HLS keeps its manifest
+    // URL cached in hls.config.url + _playlist.currentStream.url, and polling
+    // reuses the cached (stale) URL. So every 30s (with the watchdog tick) we
+    // rewrite the stored URLs to startTime=now-30. Next poll then fetches a
+    // fresh window. load() wrapper is kept for 403 counting only.
+    var _smgHookTimer = null;
+    // ===== v0.33 ROOT CAUSE FIX: HLS freezes the live poll URL =====
+    // Playwright 2026-10-23 (instrumented the live HLS instance, build 3.0.20):
+    //
+    //   // hls._refreshM3U8()
+    //   var r = this._playlist.currentStream;
+    //   var o = r.url;                        // <-- captured ONCE as a string
+    //   this._manifestLoader.load(o, ...).then(function () {
+    //       if (hls.isLive) hls._pollM3U8(o, l, c);   // <-- SAME string forever
+    //   });
+    //
+    //   // hls._pollM3U8(url, ...) -> _manifestLoader.poll(url, ..., 10s)
+    //   poll(url, a, b, onOk, onErr, ms) {
+    //       var f = function () { load(url, a, b).then(function (v) {
+    //           if (!v[0]) return;            // <-- also: loop DIES, no reschedule
+    //           onOk(...); this._timer = setTimeout(f, ms);
+    //       }); };
+    //       this._timer = setTimeout(f, ms);
+    //   }
+    //
+    // The CDN returns a FIXED ~30s window per startTime
+    // (#EXT-X-VERSION:6, 3 x 10s segments, MEDIA-SEQUENCE never advances for a
+    // given startTime). Because that URL string is frozen inside the poll
+    // closure, every poll re-fetches the SAME 3 segments: once they are
+    // consumed (~30s) nothing new is appended and playback freezes at 29.9-32.0s
+    // with readyState 2, full buffer, NO error and NO 403 — exactly the
+    // [Mon] signature (dCt=0 rs=2 err=- m403=0) users report.
+    //
+    // Measured proof: 3 polls in 40s all used startTime=1792723656, and
+    // hls.config.url / player.config.url / currentStream.url were rewritten by
+    // the v0.29-v0.31 slide — yet the poll still asked for the OLD startTime.
+    // Rewriting the stored URLs is therefore useless; the ONLY code that still
+    // runs on every poll cycle is the loader itself, so startTime must be
+    // rewritten HERE, per load() call, and monotonically.
+    var _smgLastLiveStart = 0;
+    // Install the startTime rewriter + 403 counter on a GIVEN loader. Called
+    // from hookManifestLoader right after the loader is known to exist — no
+    // racing with HLS init.
+    function smgInstallLiveLoaderHook(manifestLoader) {
+        try {
+            if (!manifestLoader || manifestLoader._smg403Hooked) return true;
+            manifestLoader._smg403Hooked = true;
+            var origLoad = manifestLoader.load.bind(manifestLoader);
+            manifestLoader.load = function(url) {
+                var callArgs = [].slice.call(arguments);
+                // v0.33: every poll tick must advance the window. Monotonic so
+                // MEDIA-SEQUENCE always moves forward (never re-serve an old
+                // window); now-30 keeps us at the live edge of a 30s manifest.
+                try {
+                    if (typeof callArgs[0] === "string" && callArgs[0].indexOf("startTime=") !== -1) {
+                        var fresh = Math.floor(Date.now() / 1000) - 30;
+                        if (fresh <= _smgLastLiveStart) fresh = _smgLastLiveStart + 1;
+                        _smgLastLiveStart = fresh;
+                        callArgs[0] = callArgs[0].replace(/startTime=\d+/, "startTime=" + fresh);
+                    }
+                } catch (e) {}
+                var p;
+                try {
+                    p = origLoad.apply(this, callArgs);
+                } catch (e) {
+                    throw e;
+                }
+                if (p && typeof p.catch === "function") {
+                    p.catch(function(err) {
+                        if (smgIs403(err)) {
+                            smgNoteManifest403();
+                            console.warn("[SMGTV] [Live] manifest 403 (" + _smgManifest403 + "/" + SMG_MANIFEST_403_LIMIT + ")");
+                        }
+                    });
+                }
+                return p;
+            };
+            console.log("[SMGTV] [Live] loader hooked (startTime rewrite + 403 counter)");
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+    // v0.33: _manifestLoader.poll() bails out permanently when a load resolves
+    // with an empty playlist (`if (!v[0]) return;` — no reschedule). A transient
+    // hiccup can therefore kill the live reload loop forever. Detect the dead
+    // timer and re-arm it with a fresh URL instead of rebuilding the player.
+    function smgRearmLivePoll(player) {
+        try {
+            var hls = player && player.plugins && player.plugins.hls && player.plugins.hls.hls;
+            if (!hls || !hls._playlist) return false;
+            var ml = hls._manifestLoader;
+            if (ml && ml._timer) return false;          // poll loop still alive
+            if (typeof hls._pollM3U8 !== "function") return false;
+            var cs = hls._playlist.currentStream;
+            var url = (cs && cs.url) || (hls.config && hls.config.url) ||
+                (player.config && player.config.url);
+            if (!url) return false;
+            console.log("[SMGTV] [Live] poll timer dead — re-arming playlist poll");
+            hls._pollM3U8(url, null, null);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+    function smgSlideLiveWindow(player) {
+        try {
+            if (!player) return false;
+            var hlsPlugin = player.plugins && player.plugins.hls;
+            var hls = hlsPlugin && hlsPlugin.hls;
+            if (!hls) return false;
+            var fresh = Math.floor(Date.now() / 1000) - 30;
+            var changed = false;
+            // 1. hls.config.url — HLS keeps the manifest URL here.
+            try {
+                if (hls.config && typeof hls.config.url === "string" &&
+                    hls.config.url.indexOf("startTime=") !== -1) {
+                    var nu = hls.config.url.replace(/startTime=\d+/, "startTime=" + fresh);
+                    if (nu !== hls.config.url) { hls.config.url = nu; changed = true; }
+                }
+            } catch (e) {}
+            // 2. _playlist.currentStream.url — the parsed playlist's source URL.
+            try {
+                var pl = hls._playlist;
+                if (pl && pl.currentStream && typeof pl.currentStream.url === "string" &&
+                    pl.currentStream.url.indexOf("startTime=") !== -1) {
+                    var nu2 = pl.currentStream.url.replace(/startTime=\d+/, "startTime=" + fresh);
+                    if (nu2 !== pl.currentStream.url) { pl.currentStream.url = nu2; changed = true; }
+                }
+            } catch (e) {}
+            // 3. player.config.url — xgplayer's own copy (used by switchURL-less polls).
+            try {
+                if (player.config && typeof player.config.url === "string" &&
+                    player.config.url.indexOf("startTime=") !== -1) {
+                    var nu3 = player.config.url.replace(/startTime=\d+/, "startTime=" + fresh);
+                    if (nu3 !== player.config.url) { player.config.url = nu3; changed = true; }
+                }
+            } catch (e) {}
+            if (changed) console.log("[SMGTV] [Live] window slid → ts=" + fresh);
+            return changed;
+        } catch (e) {
+            return false;
+        }
+    }
+    function smgHookLiveManifest403(player) {
+        function doHook() {
+            try {
+                if (!player || !vue_playerAlive(player)) return false;
+                var hlsPlugin = player.plugins && player.plugins.hls;
+                var hls = hlsPlugin && hlsPlugin.hls;
+                if (!hls || !hls._manifestLoader) return false;
+                return smgInstallLiveLoaderHook(hls._manifestLoader);
+            } catch (e) {
+                return false;
+            }
+        }
+        // Hook now, and keep re-hooking: switchURL() creates a brand-new HLS
+        // instance whose loader is unhooked. Check every 2s. The window slide
+        // itself happens in the watchdog tick (smgSlideLiveWindow).
+        doHook();
+        if (_smgHookTimer) clearInterval(_smgHookTimer);
+        _smgHookTimer = setInterval(function() {
+            try {
+                var v = findVue();
+                if (!v || !v.player) return;
+                doHook.call(null);
+            } catch (e) {}
+        }, 2000);
+    }
+    function vue_playerAlive(player) {
+        try {
+            var v = findVue();
+            return !!(v && v.player && v.player === player);
+        } catch (e) {
+            return true;
+        }
+    }
+
+    // ===== 4c. Replay: build volc-stream shift URL for past programs =====
+    // The CDN supports time-shift via &startTime= parameter on the same /live/ stream.
+    // Each manifest returns ~30s; HLS.js auto-polls for continuous playback.
+    // v0.18: token comes from the async donor bootstrap (smgEnsureToken), NOT from
+    // the live player URL (server emptied ch10 live_address, so no live URL exists).
+    function buildShiftUrl(playerUrl, startTime) {
+        try {
+            var url = new URL(playerUrl);
+            var token = url.searchParams.get("token");
+            var volcSecret = url.searchParams.get("volcSecret");
+            var volcTime = url.searchParams.get("volcTime");
+            var match = url.pathname.match(/\/live\/([^/]+)\//);
+            if (!match || !token) return null;
+            var streamName = match[1];
+            return "https://volc-stream.kksmg.com/live/" + streamName +
+                "/index.m3u8?token=" + token +
+                "&volcSecret=" + volcSecret +
+                "&volcTime=" + volcTime +
+                "&startTime=" + startTime;
+        } catch(e) {
+            console.warn("[SMGTV] buildShiftUrl error:", e);
+            return null;
+        }
+    }
+
+    // ===== 4c. Replay: dynamic startTime + real source-switch seeking =====
+    // ROOT CAUSE: CDN shift manifest returns only 3 segments (~30s) for a fixed startTime.
+    // Same startTime → same 3 segments every time. After 30s, HLS.js re-fetches → same data → freeze.
+    // FIX: Before each manifest load, rewrite startTime = programStartTime + playback position.
+    // This makes each poll fetch segments from the CURRENT playback position, enabling infinite replay.
+    // For seek: switch the complete HLS source so old MSE data cannot remain on screen.
+    var _initPlayerPatched = false;
+    // v0.26: in-flight guard. tryPatch can fire 2-3 times per program switch
+    // (programs + program/detail + fetch), each calling initPlayer while the
+    // first token bootstrap is still async. Without this, every callback does
+    // destroyPlayer + new player and they tear each other down = endless spinner.
+    var _smgInitInFlight = null;
+    var _smgLastBuiltKey = null;
+    function patchInitPlayer(vue) {
+        if (_initPlayerPatched) return;
+        if (!vue || typeof vue.initPlayer !== "function") return;
+
+        var origInitPlayer = vue.initPlayer;
+        vue.initPlayer = function() {
+            try {
+                var pObj = vue.programObj;
+                // Same program already building/built? skip the duplicate call.
+                // v0.31-fix: the guard must ALSO cover the already-built case.
+                // The error-4 rebuild path calls initPlayer again for the same
+                // program AFTER a player exists; without this check each rebuild
+                // re-enters the token bootstrap and stacks another player.
+                var progKey = pObj && (pObj.id + ":" + pObj.start_time);
+                if (_smgInitInFlight && _smgInitInFlight.key === progKey) {
+                    console.log("[SMGTV] [Replay] initPlayer already in flight for", progKey, "— skipping duplicate");
+                    return;
+                }
+                if (vue.player && vue.player.config && vue.player.config.url &&
+                    _smgLastBuiltKey === progKey) {
+                    console.log("[SMGTV] [Replay] player already built for", progKey, "— skipping duplicate");
+                    return;
+                }
+                _smgInitInFlight = { key: progKey };
+                // Any program with start_time — create player directly via donor token.
+                // v0.18: server emptied ch10 live_address, so the old "steal token from
+                // live player URL" path is dead. smgEnsureToken fetches a donor
+                // shift_address (daily sports news) and decrypts a fresh token.
+                // Works for live-edge (play=1, startTime=now-30s) and replay alike.
+                if (pObj && pObj.start_time) {
+                    var self = this;
+                    var args = arguments;
+                    // v0.25: live uses startTime=now-30s (see smgBuildLiveUrl).
+                    // The v0.19 bare manifest is now rejected by the CDN (403).
+                    // Token expiry mid-stream is handled by the watchdog, which
+                    // re-issues a fresh startTime window on every refresh.
+                    var isLiveEdge = pObj.play !== 0;
+                    var wantStart = isLiveEdge ? (Math.floor(Date.now() / 1000) - 30) : pObj.start_time;
+                    smgEnsureToken(vue, function(t) {
+                        if (!t) {
+                            _smgInitInFlight = null;
+                            console.error("[SMGTV] [Replay] no token, falling back to orig initPlayer");
+                            return origInitPlayer.apply(self, args);
+                        }
+                        // A newer initPlayer call for another program may have
+                        // started while this token fetch was in flight — don't
+                        // clobber it.
+                        if (!_smgInitInFlight || _smgInitInFlight.key !== progKey) {
+                            console.log("[SMGTV] [Replay] superseded by newer initPlayer, aborting build for", progKey);
+                            return;
+                        }
+                        var shiftUrl = isLiveEdge ? smgBuildLiveUrl(t) : smgBuildShiftUrl(t, wantStart);
+                        if (shiftUrl) {
+                            pObj.is_shield = 0;
+                            pObj.is_review = 1;
+                            vue.isCopyright = true;
+                            vue.destroyPlayer();
+
+                            var volume = localStorage.getItem("playerVolume");
+                            volume = volume ? Number(volume) : 0.5;
+
+                            // Track program start time for dynamic startTime calculation.
+                            // Live (play=1): startTime=now-30s edge window — NO
+                            // virtual-pos rewriting, watchdog handles token refresh.
+                            var programStartTime = isLiveEdge ? (Math.floor(Date.now() / 1000) - 30) : pObj.start_time;
+                            var programEndTime = pObj.end_time || (programStartTime + 7200);
+
+                            vue.player = new vue.$xgplayer({
+                                el: vue.$refs.livePlayer,
+                                url: shiftUrl,
+                                isLive: isLiveEdge,
+                                fluid: true,
+                                crossOrigin: true,
+                                controls: true,
+                                volume: volume,
+                                playbackRate: [2, 1.5, 1.25, 1, 0.75, 0.5],
+                                ignores: ["cssFullscreen"],
+                                keyShortcut: true,
+                                lang: "zh-cn",
+                                closeVideoClick: true,
+                                plugins: [vue.$hlsPlayer]
+                            });
+                            vue.player.muted = vue.isMuted;
+
+                            // --- Hook into HLS.js manifest loader for dynamic startTime ---
+                            // v0.31: hook BOTH the replay virtual-pos rewriter AND
+                            // the live 403-counter/slide hook here, right after the
+                            // player is built. The old code called smgHookLiveManifest403
+                            // AFTER this block, but hookManifestLoader's 200ms timer
+                            // hadn't installed anything yet — and more importantly the
+                            // live hook lived in a separate timer that raced with HLS
+                            // init. Doing it here guarantees the loader exists.
+                            function hookManifestLoader(player) {
+                                // Wait for HLS.js plugin to initialize (may need a tick)
+                                var attempts = 0;
+                                var hookTimer = setInterval(function() {
+                                    attempts++;
+                                    var hlsPlugin = player.plugins && player.plugins.hls;
+                                    var hls = hlsPlugin && hlsPlugin.hls;
+                                    if (!hls || !hls._manifestLoader) {
+                                        if (attempts > 20) { clearInterval(hookTimer); }
+                                        return;
+                                    }
+                                    clearInterval(hookTimer);
+
+                                    var manifestLoader = hls._manifestLoader;
+                                    // Live: install 403-counter on this loader.
+                                    // (Replay installs the virtual-pos rewriter
+                                    // below; live must NOT be rewritten here —
+                                    // live sliding is done by smgSlideLiveWindow
+                                    // rewriting the stored HLS URLs.)
+                                    // v0.31-fix: the loader object can be REPLACED
+                                    // (not just re-hooked) by switchURL — check the
+                                    // flag on the HLS instance instead of trusting
+                                    // the closure. If already hooked, skip.
+                                    if (isLiveEdge) {
+                                        if (hls._smgLiveHooked) {
+                                            console.log("[SMGTV] [Live] loader already hooked, skipping");
+                                            return;
+                                        }
+                                        hls._smgLiveHooked = true;
+                                        smgInstallLiveLoaderHook(manifestLoader);
+                                        console.log("[SMGTV] [Live] loader hook installed (no URL rewrite here)");
+                                        return;
+                                    }
+                                    var origMlLoad = manifestLoader.load.bind(manifestLoader);
+
+                                    // --- Seek + position tracking ---
+                                    // HLS.js returns a short, relative media timeline after every
+                                    // shift-manifest load. Calling manifestLoader.load() alone only
+                                    // downloads the manifest; it does not replace the old MSE buffer.
+                                    //
+                                    // Use xgplayer.switchURL() for a real source switch. Its HLS
+                                    // implementation clears the old buffer, loads the new manifest,
+                                    // selects the first segment, and starts the media at relative 0.
+                                    // _virtualPos is the position in the full program and is exposed
+                                    // to the progress controls through offsetCurrentTime.
+                                    var _virtualPos = 0;
+                                    var _virtualPosTs = Date.now();
+                                    var _isSeeking = false;
+                                    var _hasUserSeek = false;
+                                    var _seekGeneration = 0;
+                                    var _seekDebounceTimer = null;
+                                    var _seekSwitchQueue = Promise.resolve();
+
+                                    // The HLS plugin resets offsetCurrentTime to -1 while it
+                                    // clears/rebuilds MediaSource. Install an instance-level
+                                    // logical-time property so the progress/time controls keep
+                                    // showing the program position during and after that reset.
+                                    try {
+                                        Object.defineProperty(player, "offsetCurrentTime", {
+                                            get: function() { return _virtualPos; },
+                                            set: function() {},
+                                            configurable: true,
+                                            enumerable: true
+                                        });
+                                    } catch (e) {
+                                        console.warn("[SMGTV] [Replay] Could not lock offsetCurrentTime:", e);
+                                    }
+
+                                    function clampVirtualPos(pos) {
+                                        pos = Number(pos);
+                                        if (!isFinite(pos)) return 0;
+                                        return Math.max(0, Math.min(
+                                            programEndTime - programStartTime, pos));
+                                    }
+
+                                    function publishVirtualPos() {
+                                        // The instance getter above is the source of truth. Keep
+                                        // this call for fallback compatibility if defineProperty
+                                        // is unavailable in an older browser.
+                                        player.offsetCurrentTime = _virtualPos;
+                                    }
+
+                                    // v0.22: expose the current program position so the replay
+                                    // watchdog can re-issue the shift URL at the same spot when
+                                    // the token must be refreshed mid-playback.
+                                    player._smgReplayPos = function() {
+                                        return { start: programStartTime, pos: _virtualPos };
+                                    };
+
+                                    // Advance the program position independently from the relative
+                                    // media currentTime. This survives HLS.js resetting media time
+                                    // to 0 after a source switch.
+                                    setInterval(function() {
+                                        if (!player.paused && !_isSeeking) {
+                                            var now = Date.now();
+                                            _virtualPos += (now - _virtualPosTs) / 1000;
+                                            _virtualPosTs = now;
+                                            _virtualPos = clampVirtualPos(_virtualPos);
+                                            publishVirtualPos();
+                                        } else {
+                                            _virtualPosTs = Date.now();
+                                        }
+                                    }, 500);
+
+                                    // Before the first user seek, media time and program time are
+                                    // identical, so it is safe to synchronize the virtual position.
+                                    setInterval(function() {
+                                        if (!player.paused && !_isSeeking && !_hasUserSeek) {
+                                            _virtualPos = clampVirtualPos(player.currentTime);
+                                            _virtualPosTs = Date.now();
+                                            publishVirtualPos();
+                                        }
+                                    }, 1000);
+                                    publishVirtualPos();
+
+                                    // Override player.seek() — the progress plugin calls this for a
+                                    // user click/drag. Do NOT call the original seek(time): the new
+                                    // manifest's media timeline starts at 0, not at `time` (2400s).
+                                    player.seek = function(time) {
+                                        var target = clampVirtualPos(time);
+                                        var seekTs = Math.floor(programStartTime + target);
+                                        ++_seekGeneration;
+                                        var wasPaused = player.paused;
+                                        _hasUserSeek = true;
+                                        _virtualPos = target;
+                                        _virtualPosTs = Date.now();
+                                        _isSeeking = true;
+                                        publishVirtualPos();
+
+                                        if (_seekDebounceTimer) {
+                                            clearTimeout(_seekDebounceTimer);
+                                        }
+
+                                        console.log("[SMGTV] [Replay] Seek target → pos=" +
+                                            target.toFixed(1) + "s", "seekTime=" + seekTs);
+
+                                        // The progress plugin calls seek repeatedly while dragging.
+                                        // Switch only once after the drag settles; otherwise several
+                                        // asynchronous HLS resets race and the last old request wins.
+                                        _seekDebounceTimer = setTimeout(function() {
+                                            var finalTarget = _virtualPos;
+                                            var finalTs = Math.floor(programStartTime + finalTarget);
+                                            var finalGeneration = _seekGeneration;
+                                            var finalWasPaused = player.paused;
+
+                                            // A drag can produce several seek() calls. Queue complete
+                                            // source switches so an older async switch cannot race
+                                            // with and overwrite the latest target.
+                                            _seekSwitchQueue = _seekSwitchQueue.catch(function() {}).then(function() {
+                                                if (finalGeneration !== _seekGeneration) return;
+
+                                                var seekUrl = smgBuildShiftUrl(_smgTokenCache, finalTs);
+                                                if (!seekUrl || typeof player.switchURL !== "function") {
+                                                    console.error("[SMGTV] [Replay] switchURL unavailable; seek cancelled");
+                                                    _isSeeking = false;
+                                                    return;
+                                                }
+
+                                                console.log("[SMGTV] [Replay] Switching source:",
+                                                    "vPos=" + finalTarget.toFixed(1) + "s",
+                                                    "seekTime=" + finalTs);
+
+                                                // switchURL performs the full HLS reset. currentTime: 0
+                                                // is relative to the new manifest, not the program.
+                                                var switchPromise;
+                                                try {
+                                                    switchPromise = player.switchURL(seekUrl, {
+                                                        seamless: false,
+                                                        currentTime: 0
+                                                    });
+                                                } catch (error) {
+                                                    _isSeeking = false;
+                                                    console.error("[SMGTV] [Replay] Seek source switch failed:", error);
+                                                    return;
+                                                }
+
+                                                return Promise.resolve(switchPromise).then(function() {
+                                                    if (finalGeneration !== _seekGeneration) return;
+                                                    _isSeeking = false;
+                                                    _virtualPosTs = Date.now();
+                                                    publishVirtualPos();
+                                                    if (finalWasPaused) player.pause();
+                                                    else player.play();
+                                                    console.log("[SMGTV] [Replay] Seek source switched:",
+                                                        "vPos=" + _virtualPos.toFixed(1) + "s");
+                                                }).catch(function(error) {
+                                                    if (finalGeneration !== _seekGeneration) return;
+                                                    _isSeeking = false;
+                                                    console.error("[SMGTV] [Replay] Seek source switch failed:", error);
+                                                });
+                                            });
+                                        }, 150);
+
+                                        return undefined;
+                                    };
+
+                                    // Override manifestLoader.load — ALWAYS use _virtualPos
+                                    // v0.22: also count 403s so the replay watchdog can force a
+                                    // token refresh when the 10-min volcTime token expires
+                                    // mid-program (fixes "black screen at ~9 min").
+                                    manifestLoader.load = function(url) {
+                                        var result;
+                                        if (typeof url === "string" && url.indexOf("startTime=") !== -1) {
+                                            var newStartTime = Math.floor(programStartTime + _virtualPos);
+                                            var newUrl = url.replace(/startTime=\d+/, "startTime=" + newStartTime);
+                                            if (newUrl !== url) {
+                                                console.log("[SMGTV] [Replay] startTime→",
+                                                    "vPos=" + _virtualPos.toFixed(1) + "s",
+                                                    "→ ts=" + newStartTime);
+                                            }
+                                            result = origMlLoad(newUrl);
+                                        } else {
+                                            result = origMlLoad.apply(this, arguments);
+                                        }
+                                        if (result && typeof result.catch === "function") {
+                                            result.catch(function(err) {
+                                                if (smgIs403(err)) {
+                                                    smgNoteManifest403();
+                                                    console.warn("[SMGTV] [Replay] manifest 403 (" + _smgManifest403 + "/" + SMG_MANIFEST_403_LIMIT + ")");
+                                                }
+                                            });
+                                        }
+                                        return result;
+                                    };
+
+                                    console.log("[SMGTV] [Replay] Manifest loader hooked (virtual pos tracker)");
+                                    var dur = programEndTime - programStartTime;
+                                    // Override video.duration with a getter so xgplayer always
+                                    // sees the real program duration (even if codec fails to init)
+                                    Object.defineProperty(player.video, "duration", {
+                                        get: function() { return dur; },
+                                        configurable: true
+                                    });
+                                    player._duration = dur;
+
+                                    console.log("[SMGTV] [Replay] Program duration set:",
+                                        dur + "s (" + (dur / 60).toFixed(1) + " min)");
+                                }, 200);
+                            }
+
+                            // Live-edge needs no virtual-pos machinery: the manifest is
+                            // already a live sliding window. Watchdog keeps the token
+                            // fresh instead. Only hook for replay.
+                            // v0.21: live ALSO hooks the manifest loader, but ONLY to
+                            // count 403s for the watchdog — no URL rewriting.
+                            // v0.22: replay also needs token refresh — a program runs
+                            // 40-90 min but the token volcTime is only 10 min, so replay
+                            // froze mid-way without a refresh watchdog.
+                            if (!isLiveEdge) {
+                                hookManifestLoader(vue.player);
+                                smgStartReplayWatchdog(vue, vue.player, function() {
+                                    return (vue.player && vue.player._smgReplayPos)
+                                        ? vue.player._smgReplayPos() : null;
+                                });
+                            } else {
+                                smgStartLiveWatchdog(vue, vue.player, function(tok) {
+                                    return smgBuildLiveUrl(tok);
+                                });
+                                smgHookLiveManifest403(vue.player);
+                            }
+                            // v0.31-fix: re-hook after EVERY switchURL. switchURL
+                            // rebuilds the whole HLS instance, so the loader hook
+                            // installed above is silently lost — polling then uses
+                            // the stale fixed startTime and stalls at ~30s.
+                            // Wrap once per player (guard on the player object).
+                            if (!vue.player._smgSwitchWrapped) {
+                                vue.player._smgSwitchWrapped = true;
+                                (function(pl) {
+                                    var origSwitch = pl.switchURL.bind(pl);
+                                    pl.switchURL = function() {
+                                        var r = origSwitch.apply(this, arguments);
+                                        var selfP = pl;
+                                        setTimeout(function() {
+                                            try {
+                                                var v = findVue();
+                                                if (v && v.player === selfP) {
+                                                    smgHookLiveManifest403(selfP);
+                                                }
+                                            } catch (e) {}
+                                        }, 1500);
+                                        return r;
+                                    };
+                                })(vue.player);
+                            }
+
+                            // Event handlers
+                            vue.player.on("canplay", function() {
+                                vue.isLoading = false;
+                                // Force xgplayer to pick up our overridden duration
+                                if (!isLiveEdge) vue.player.video.dispatchEvent(new Event("loadedmetadata"));
+                            });
+                            vue.player.on("ended", function() {
+                                if (vue.programObj.play === 0 && typeof vue.playNextProgram === "function") {
+                                    vue.playNextProgram();
+                                }
+                            });
+                            setTimeout(function() { vue.player.play(); }, 200);
+                            vue.player.video.addEventListener("click", function() {
+                                if (vue.player.paused) vue.player.play();
+                                else vue.player.pause();
+                            });
+
+                            console.log("[SMGTV] [Replay] Direct player created for:", pObj.name,
+                                "startTime:", programStartTime,
+                                "duration:", (programEndTime - programStartTime) + "s",
+                                "url:", shiftUrl.substring(0, 80));
+                            smgStartMonitor(vue, vue.player, isLiveEdge ? "live" : "replay");
+                            _smgInitInFlight = null;
+                            _smgLastBuiltKey = progKey;
+                            return;
+                        }
+                        console.warn("[SMGTV] [Replay] shift URL build failed, falling back to orig initPlayer");
+                        _smgInitInFlight = null;
+                        return origInitPlayer.apply(self, args);
+                    });
+                    // Token fetch is async; tell the caller we handled it.
+                    return;
+                }
+                // Not our path (no start_time) — clear the guard and defer.
+                _smgInitInFlight = null;
+            } catch(e) {
+                _smgInitInFlight = null;
+                console.error("[SMGTV] [Replay] initPlayer intercept error:", e);
+            }
+            return origInitPlayer.apply(this, arguments);
+        };
+        _initPlayerPatched = true;
+        console.log("[SMGTV] [Replay] initPlayer patched");
+    }
+
+    function tryPatch() {
+        var vue = findVue();
+        if (!vue) return false;
+
+        console.log("[SMGTV] Vue component found, patching...");
+
+        // Patch initPlayer for replay (only once)
+        patchInitPlayer(vue);
+
+        // Re-apply playable fields on the component and its program lists.
+        smgFixProgramFields(vue);
+
+        // Restore live_address from channel detail (server removed it from program detail API)
+        if (vue.currChannelDetail && vue.currChannelDetail.live_address) {
+            if (!vue.programDetail) vue.programDetail = {};
+            if (!vue.programDetail.channel_info) vue.programDetail.channel_info = {};
+            if (!vue.programDetail.channel_info.live_address) {
+                vue.programDetail.channel_info.live_address = vue.currChannelDetail.live_address;
+            }
+        }
+
+        // Disable isCopyright to prevent auto-init (we control initPlayer ourselves)
+        vue.isCopyright = false;
+
+        if (typeof vue.countdown === "number") vue.countdown = 99999999;
+        vue.showOpenApp = false;
+        vue.showFlag = false;
+        if (typeof vue.startCountdown === "function") vue.startCountdown = function() {};
+        if (vue.liveTimer) { clearTimeout(vue.liveTimer); vue.liveTimer = null; }
+
+        if (typeof vue.pageVisibilityChange === "function") {
+            document.removeEventListener("visibilitychange", vue.pageVisibilityChange);
+            vue.pageVisibilityChange = function() {};
+            document.addEventListener("visibilitychange", vue.pageVisibilityChange);
+        }
+
+        // Init player — but never while one already exists or is being built.
+        // v0.26: the page fires 2-3 /content/pc/tv/* responses per program
+        // switch; each used to call initPlayer again while the first token
+        // bootstrap was still async → 3 players built in a row, each tearing
+        // down the previous one = endless spinner with picture but no playback.
+        if (!vue.player && !_smgInitInFlight && vue.programObj && vue.programObj.id) {
+            console.log("[SMGTV] Calling initPlayer()...");
+            try { vue.initPlayer(); } catch(e) { console.error("[SMGTV] initPlayer error:", e); }
+        } else if (vue.player || _smgInitInFlight) {
+            console.log("[SMGTV] Player exists or building — skipping duplicate initPlayer");
+        }
+
+        vue.$forceUpdate();
+        vue.__smgPatched = true;
+        console.log("[SMGTV] Patch applied!");
+        return true;
+    }
+
+    // --- Initial patch with enhanced retry (60s for Safari/Stay) ---
+    if (tryPatch()) {
+        console.log("[SMGTV] Patched immediately");
+    } else {
+        console.log("[SMGTV] Waiting for component...");
+        var observer = new MutationObserver(function() {
+            if (tryPatch()) observer.disconnect();
         });
-    };
-}
-ensureViewportFitCover();
-syncSiteApiVersion();
-loadDonorMemo();
-initComponentPatch();
-initFullscreenPatch();
-if (document.body) {
-    checkScriptUpdate();
-} else {
-    document.addEventListener('DOMContentLoaded', checkScriptUpdate, { once: true });
-}
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+
+        var count = 0;
+        var timer = setInterval(function() {
+            count++;
+            if (tryPatch()) {
+                clearInterval(timer);
+                observer.disconnect();
+                console.log("[SMGTV] Patched after " + count + " polls");
+            } else if (count >= 120) {
+                clearInterval(timer);
+                observer.disconnect();
+                console.warn("[SMGTV] Timeout after 60s — check Console [SMGTV] logs for diagnostics");
+            }
+        }, 500);
+    }
+
+    // ===== 5. SPA route change: re-patch when user switches channels =====
+    var lastHref = location.href;
+    setInterval(function() {
+        // Re-hide mask
+        var mask = document.querySelector(".image-mask");
+        if (mask && mask.style.display !== "none") mask.style.display = "none";
+
+        // Detect SPA navigation
+        if (location.href !== lastHref) {
+            lastHref = location.href;
+            console.log("[SMGTV] Route changed, re-patching in 2s...");
+            setTimeout(tryPatch, 2000);
+        }
+    }, 1000);
+
 })();
