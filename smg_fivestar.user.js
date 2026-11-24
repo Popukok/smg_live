@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.26
-// @description      收看SMGTV，并解除页面部分限制
+// @version          0.27
+// @description      收看SMGTV，并解除页面部分限制（兼容桌面 Tampermonkey 与 iOS Safari Userscripts）
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
 // @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
 // @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
 // @run-at           document-start
+// @inject-into      page
 // @grant            GM_xmlhttpRequest
 // @grant            unsafeWindow
 // @connect          kapi.kankanews.com
@@ -28,6 +29,7 @@
         } catch (e) {}
     }
     const STYLE_ID = 'smgtv-unlock-style';
+    const M3U8_SIG_CACHE_TTL_MS = 15 * 60 * 1000;
     const VIDEO_READY_CLASS = 'smgtv-video-ready';
     const FULLSCREEN_FALLBACK_CLASS = 'smgtv-fallback-fullscreen';
     const FULLSCREEN_TARGET_CLASS = 'smgtv-fallback-fullscreen-target';
@@ -39,10 +41,11 @@
     const streamAddressCache = Object.create(null);
     const channelShiftBaseCache = Object.create(null);
     const channelLiveBaseCache = Object.create(null);
+    const m3u8SigCache = Object.create(null);
     const STREAM_RENEW_MARGIN_MS = 120000;
     const STREAM_RENEW_COOLDOWN_MS = 60000;
-    const SEAMLESS_FALLBACK_MS = 8000;
     const BASE_SAFETY_MS = 5000;
+    const SCRIPT_VERSION = '0.27';
     const UPDATE_CHECK_URL = 'https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js';
     const UPDATE_INSTALL_URL = UPDATE_CHECK_URL;
     const UPDATE_CHECK_INTERVAL_MS = 6 * 3600000;
@@ -329,6 +332,42 @@
         return merged;
     }
     function shortUrl(url) { return url.split('kankanews.com')[1] || ''; }
+    function nativeFetchGet(url, headers, timeoutMs) {
+        return new Promise((resolve) => {
+            let fetcher = null;
+            try { fetcher = typeof RAW_FETCH === 'function' ? RAW_FETCH : null; } catch (e) {}
+            if (!fetcher && typeof fetch === 'function') fetcher = fetch.bind(typeof window !== 'undefined' ? window : globalThis);
+            if (!fetcher) { resolve(null); return; }
+            let timer = null;
+            const opts = { method: 'GET', headers: headers || {}, credentials: 'omit' };
+            try {
+                const AC = (UW && UW.AbortController) || (typeof AbortController === 'function' ? AbortController : null);
+                if (AC) {
+                    const controller = new AC();
+                    opts.signal = controller.signal;
+                    timer = setTimeout(() => { try { controller.abort(); } catch (e) {} }, timeoutMs || 15000);
+                }
+            } catch (e) {}
+            Promise.resolve(fetcher(url, opts)).then(res => {
+                if (timer) clearTimeout(timer);
+                if (!res || !res.ok) {
+                    console.warn('[SMGTV] 原生接口异常 status=', res && res.status, shortUrl(url));
+                }
+                return res && typeof res.text === 'function' ? res.text() : '';
+            }).then(txt => {
+                try {
+                    resolve(txt ? JSON.parse(txt) : null);
+                } catch (e) {
+                    console.warn('[SMGTV] 原生响应解析失败', shortUrl(url));
+                    resolve(null);
+                }
+            }).catch(e => {
+                if (timer) clearTimeout(timer);
+                console.warn('[SMGTV] 原生请求失败', shortUrl(url), e && e.message);
+                resolve(null);
+            });
+        });
+    }
     function gmApiGet(url, headers) {
         let gmHeaders = headers;
         try {
@@ -337,6 +376,7 @@
         } catch (e) {}
         return new Promise((resolve) => {
             try {
+                if (typeof GM_xmlhttpRequest !== 'function') { resolve(null); return; }
                 GM_xmlhttpRequest({
                     method: 'GET',
                     url: url,
@@ -425,9 +465,9 @@
         headers['M-Uuid'] = getClientUuid();
         const url = 'https://kapi.kankanews.com' + path + (q ? '?' + q : '');
         let pageFetch;
+        let timer = null;
         try {
             const opts = { headers: headers };
-            let timer = null;
             if (typeof UW.AbortController === 'function') {
                 const controller = new UW.AbortController();
                 opts.signal = controller.signal;
@@ -435,9 +475,7 @@
                     try { controller.abort(); } catch (e) {}
                 }, 12000);
             }
-            pageFetch = Promise.resolve(RAW_FETCH(url, opts)).finally(() => {
-                if (timer) clearTimeout(timer);
-            });
+            pageFetch = Promise.resolve(RAW_FETCH(url, opts));
         } catch (e) {
             return gmApiGet(url, headers);
         }
@@ -449,6 +487,9 @@
                 return res.text();
             })
             .then(txt => JSON.parse(txt))
+            .finally(() => {
+                if (timer) clearTimeout(timer);
+            })
             .catch(e => {
                 console.warn('[SMGTV] 页面fetch失败, 转GM兜底:', shortUrl(url), e && e.message);
                 return gmApiGet(url, headers);
@@ -1111,10 +1152,12 @@
             crossTabRelease();
             component.__smgAcquiring = false;
             if (String(getCompChannelId(component)) !== String(chId)) return;
-            if (playbackKey(component) !== pbKey) return;
+            const keyChanged = playbackKey(component) !== pbKey;
+            if (keyChanged && opts.inPlace) return;
             if (ok) {
                 const pendingReplay = !!(opts.prefetch && component.programObj && component.programObj.play === 0);
                 const idle = hasNoPlayableSource(component);
+                if (keyChanged && !idle) return;
                 component[cooldownKey] = 0;
                 component.__smgAcquireFails = 0;
                 component.__smgNeedShiftBase = false;
@@ -1193,7 +1236,7 @@
             component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
         }
     }
-    function refreshOfficialStream(component, reason) {
+    function refreshOfficialStream(component, reason, recover) {
         const key = playbackKey(component);
         const programId = component.programObj?.id;
         const chId = getCompChannelId(component);
@@ -1220,7 +1263,12 @@
                 component.programDetail = result.detail;
                 ensurePlayableStream(component);
                 component.__smgPreferFreshBaseUntil = Date.now() + 30000;
-                if (!applyStreamUrlInPlace(component, reason)) {
+                rememberM3u8Signature(result.url);
+                if (recover) {
+                    dlog('[dev] 故障恢复：刷新地址后重建播放器');
+                    rememberPlaybackPosition(component, getPlayerVideo(component));
+                    rebuildCurrentPlayer(component);
+                } else if (!applyStreamUrlInPlace(component, reason)) {
                     rememberPlaybackPosition(component, getPlayerVideo(component));
                     rebuildCurrentPlayer(component);
                 }
@@ -1229,76 +1277,83 @@
             .finally(() => { component.__smgRefreshingDetails = false; });
         return true;
     }
-    function applyStreamUrlInPlace(component, reason) {
-        const player = component && component.player;
-        if (!player || typeof player.switchURL !== 'function') {
-            dlog('[dev] 就地换源：播放器不支持 switchURL → 回退重建');
-            return false;
-        }
-        if (player.root && player.root.isConnected === false) {
-            dlog('[dev] 就地换源：播放器实例已脱离文档 → 回退重建');
-            return false;
-        }
-        const url = computeCurrentStreamUrl(component);
-        if (!url) {
-            dlog('[dev] 就地换源：取不到可用地址 → 回退重建');
-            return false;
-        }
-        const isReplay = component.programObj?.play === 0;
-        const video = getPlayerVideo(component);
-        const wasPaused = !!(video && video.paused);
-        const key = playbackKey(component);
-        const supportsSeamless = /seamless/.test(String(player.switchURL));
-        const useSeamless = !isReplay && supportsSeamless;
-        const switchOpts = useSeamless ? { seamless: true, startTime: 0 }
-            : (isReplay ? undefined : { startTime: 0 });
+
+    function m3u8SigKey(url) {
+        const u = new URL(url);
+        const start = u.searchParams.get('start') || '';
+        const end = u.searchParams.get('end') || '';
+        return u.pathname + '|' + start + '_' + end;
+    }
+    function rememberM3u8Signature(url) {
         try {
-            const ret = player.switchURL(url, switchOpts);
-            console.log('[SMGTV] 播放源续期（' + reason + '）已就地换源，不重建播放器' +
-                        (useSeamless ? '（seamless 无缝）' : ''));
-            dlog('[dev] 就地换源 模式=' + (isReplay ? '回看(按进度续播)' :
-                 (useSeamless ? '直播(seamless 续播)' : '直播(回直播边缘)')),
-                 'supportsSeamless=' + supportsSeamless,
-                 'url=' + String(url).slice(0, 90));
-            if (useSeamless) {
-                armSeamlessFallback(component, player, key, video);
-            }
-            if (ret && typeof ret.then === 'function') {
-                ret.then(() => {
-                    if (wasPaused) {
-                        try { player.pause(); } catch (e) {}
-                    }
-                }).catch(err => {
-                    console.warn('[SMGTV] 就地换源未完成：', err && err.message ? err.message : err);
-                    if (component.player === player && playbackKey(component) === key) {
-                        rememberPlaybackPosition(component, getPlayerVideo(component));
-                        rebuildCurrentPlayer(component);
-                    }
-                });
-            }
+            const u = new URL(url);
+            const token = u.searchParams.get('token');
+            const volcSecret = u.searchParams.get('volcSecret');
+            const volcTime = Number(u.searchParams.get('volcTime'));
+            if (!token || !volcSecret || !isFinite(volcTime) || volcTime <= 0) return false;
+            if (!/\.m3u8(\?|$)/i.test(u.pathname)) return false;
+            const key = m3u8SigKey(url);
+            const prev = m3u8SigCache[key];
+            if (prev && prev.volcTime >= volcTime) return false; // 只接受更新的签名
+            m3u8SigCache[key] = { token, volcSecret, volcTime, at: Date.now() };
+            dlog('[dev] 缓存 m3u8 新签名 key=' + key +
+                 ' volcTime=' + volcTime + (prev ? '（原 ' + prev.volcTime + '）' : '（首次）'));
             return true;
         } catch (e) {
-            dlog('[dev] 就地换源抛错：' + (e && e.message) + ' → 回退重建');
             return false;
         }
     }
-    function armSeamlessFallback(component, player, key, video) {
-        clearTimeout(component.__smgSeamlessTimer);
-        const startPos = video ? video.currentTime : 0;
-        component.__smgSeamlessTimer = setTimeout(() => {
-            component.__smgSeamlessTimer = 0;
-            if (component.player !== player || playbackKey(component) !== key) return;
-            const nowVideo = getPlayerVideo(component);
-            const advanced = nowVideo && nowVideo.currentTime > startPos + 0.25;
-            const playable = nowVideo && !nowVideo.paused && nowVideo.readyState >= 2;
-            if (advanced && playable) return;
-            console.warn('[SMGTV] seamless 换源 ' + SEAMLESS_FALLBACK_MS / 1000 +
-                         's 内未起播，回退重建');
-            rememberPlaybackPosition(component, nowVideo);
-            rebuildCurrentPlayer(component);
-        }, SEAMLESS_FALLBACK_MS);
+    function applyFreshM3u8Signature(requestUrl) {
+        try {
+            const u = new URL(requestUrl);
+            if (!/\.m3u8(\?|$)/i.test(u.pathname)) return requestUrl;
+            const sig = m3u8SigCache[m3u8SigKey(requestUrl)];
+            if (!sig) return requestUrl;
+            if (Date.now() - sig.at > M3U8_SIG_CACHE_TTL_MS) return requestUrl;
+            const curVolcTime = Number(u.searchParams.get('volcTime'));
+            if (isFinite(curVolcTime) && curVolcTime >= sig.volcTime) return requestUrl;
+            u.searchParams.set('token', sig.token);
+            u.searchParams.set('volcSecret', sig.volcSecret);
+            u.searchParams.set('volcTime', String(sig.volcTime));
+            dlog('[dev] m3u8 签名热替换 key=' + m3u8SigKey(requestUrl) +
+                 ' volcTime ' + (isFinite(curVolcTime) ? curVolcTime : '-') + ' → ' + sig.volcTime);
+            return u.toString();
+        } catch (e) {
+            return requestUrl;
+        }
     }
-    function forceRenewStream(component, reason, rebuild, inPlace) {
+    function applyStreamUrlInPlace(component, reason) {
+        const url = computeCurrentStreamUrl(component);
+        if (!url) {
+            dlog('[dev] 续期：取不到新地址 → 交给调用方回退重建');
+            return false;
+        }
+        let hasSig = false;
+        try {
+            const u = new URL(url);
+            const vtRaw = u.searchParams.get('volcTime');
+            const vt = Number(vtRaw);
+            hasSig = !!(u.searchParams.get('token') && u.searchParams.get('volcSecret') &&
+                vtRaw && isFinite(vt) && vt > 0 &&
+                /\.m3u8(\?|$)/i.test(u.pathname));
+        } catch (e) {}
+        if (!hasSig) {
+            dlog('[dev] 续期：新地址缺签名三元组 → 无法热替换，交给调用方回退');
+            return false;
+        }
+        const stored = rememberM3u8Signature(url);
+        if (component.__smgPendingRenewExp != null) {
+            component.__smgRenewedExp = component.__smgPendingRenewExp;
+            component.__smgPendingRenewExp = null;
+        }
+        if (stored) {
+            console.log('[SMGTV] 续期完成（' + reason + '）：m3u8 签名已更新，播放器无需重建');
+        } else {
+            dlog('[dev] 续期：已有更新签名，缓存保持不变');
+        }
+        return true;
+    }
+    function forceRenewStream(component, reason, rebuild, inPlace, recover) {
         const chId = getCompChannelId(component);
         if (chId == null) {
             return false;
@@ -1307,7 +1362,7 @@
             console.log('[SMGTV] 播放源失效（' + reason + '），正在重新获取 频道' + chId);
         });
         if (!canAutoAcquire(chId)) {
-            return refreshOfficialStream(component, reason);
+            return refreshOfficialStream(component, reason, !!recover);
         }
         component.__smgNeedShiftBase = true;
         if (rebuild || inPlace) {
@@ -1455,7 +1510,7 @@
         dlog('[dev] 恢复重建 原因=' + reason, '退避=' + Math.round(backoff / 1000) + 's');
         rememberPlaybackPosition(component, video);
         ensurePlayableStream(component);
-        if (!forceRenewStream(component, reason, true)) {
+        if (!forceRenewStream(component, reason, true, false, true)) {
             rebuildCurrentPlayer(component);
         }
     }
@@ -1464,14 +1519,18 @@
         if (chId == null || chId === component.__smgLastChannelId) {
             return;
         }
+        const firstInit = component.__smgLastChannelId == null;
         component.__smgLastChannelId = chId;
         component.__smgShiftCooldown = 0;
         component.__smgAcquireFails = 0;
         component.__smgAcquiring = false;
-        component.__smgNeedShiftBase = false;
+        if (!firstInit) {
+            component.__smgNeedShiftBase = false;
+        }
         component.__smgLastRenewAt = 0;
         component.__smgLastRenewRebuildAt = 0;
         component.__smgRenewedExp = 0;
+        component.__smgPendingRenewExp = null;
         component.__smgRecoveringUntil = 0;
         component.__smgRecoverCount = 0;
         component.__smgStallWatch = null;
@@ -1524,7 +1583,7 @@
             return;
         }
         component.__smgLastRenewAt = now;
-        component.__smgRenewedExp = exp;
+        component.__smgPendingRenewExp = exp;
         const video = getPlayerVideo(component);
         const playing = isVideoReady(video);
         const rebuildGap = Math.max(60000, lifetime * 0.4);
@@ -1532,18 +1591,17 @@
         if (canRebuild) {
             component.__smgLastRenewRebuildAt = now;
             component.__smgPreferFreshBaseUntil = now + 30000;
-            rememberPlaybackPosition(component, video);
         }
         forceRenewStream(component, '地址临近到期', canRebuild, true);
     }
     function getScriptVersion() {
         try {
-            if (typeof GM_info === 'undefined') return '';
-            const v = GM_info && GM_info.script && GM_info.script.version;
-            return typeof v === 'string' ? v.trim() : '';
-        } catch (e) {
-            return '';
-        }
+            if (typeof GM_info !== 'undefined') {
+                const v = GM_info && GM_info.script && GM_info.script.version;
+                if (typeof v === 'string' && v.trim()) return v.trim();
+            }
+        } catch (e) {}
+        return SCRIPT_VERSION;
     }
     function compareVersions(a, b) {
         const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
@@ -1702,11 +1760,6 @@
     function checkScriptUpdate() {
         const current = getScriptVersion();
         if (!current) return;
-        if (typeof GM_info !== 'undefined' && GM_info.script) {
-            const updateUrl = GM_info.scriptUpdateURL ||
-                (GM_info.script && GM_info.script.updateURL);
-            if (!updateUrl) return;
-        }
         const latest = lsGet(UPDATE_LS_LATEST);
         if (latest && compareVersions(latest, current) > 0) {
             try {
@@ -1883,11 +1936,18 @@
     }
     function getPlayerVideo(component) {
         const player = component?.player;
-        return player?.video ||
-            player?.media ||
-            player?.root?.querySelector?.('video') ||
-            component?.$refs?.livePlayer?.querySelector?.('video') ||
-            document.querySelector('.live-player video, .player-box video, .xgplayer video, video');
+        let v = player?.video || player?.media;
+        if (v) return v;
+        try {
+            const pick = root => {
+                if (!root || !root.querySelector) return null;
+                return root.querySelector('video');
+            };
+            v = pick(player?.root) || pick(component?.$refs?.livePlayer);
+            if (v) return v;
+            return document.querySelector('.live-player video, .player-box video, .xgplayer video, video');
+        } catch (e) {}
+        return player?.video || player?.media || null;
     }
     function isVideoReady(video) {
         return !!video && !video.error && (
@@ -1962,10 +2022,6 @@
         if (component.__smgLoadingMonitor) {
             clearInterval(component.__smgLoadingMonitor);
             component.__smgLoadingMonitor = null;
-        }
-        if (component.__smgSeamlessTimer) {
-            clearTimeout(component.__smgSeamlessTimer);
-            component.__smgSeamlessTimer = 0;
         }
         if (component.__smgLoadingObserver) {
             component.__smgLoadingObserver.disconnect();
@@ -2479,6 +2535,7 @@
                 this.__smgRecoverProgramId = programId;
                 this.__smgRecoverCount = 0;
                 this.__smgRenewedExp = 0;
+                this.__smgPendingRenewExp = null;
                 clearResumePosition(this);
             }
             ensurePlayableStream(this);
@@ -2591,21 +2648,45 @@
         scanning = true;
         let attempts = 0;
         const maxAttempts = 50;
-        const timer = setInterval(() => {
-            const component = findTVComponent();
+        let observer = null;
+        let timer = 0;
+        const finish = (component) => {
+            if (observer) { observer.disconnect(); observer = null; }
+            if (timer) { clearInterval(timer); timer = 0; }
+            scanning = false;
             if (component) {
-                clearInterval(timer);
-                scanning = false;
+                dlog('[dev] 组件发现成功（MutationObserver + 轮询兜底）');
                 patchComponent(component);
-                return;
-            }
-            attempts += 1;
-            if (attempts >= maxAttempts) {
-                clearInterval(timer);
-                scanning = false;
+            } else {
                 console.warn('[SMGTV] 未找到播放器组件实例');
                 dlogComponentDiag();
             }
+        };
+        const tryFind = () => {
+            const component = findTVComponent();
+            if (component) finish(component);
+            return !!component;
+        };
+        if (tryFind()) return;
+        try {
+            observer = new MutationObserver(() => {
+                tryFind();
+            });
+            observer.observe(document.documentElement || document, {
+                childList: true, subtree: true
+            });
+        } catch (e) {
+            observer = null;
+        }
+        if (!observer) {
+            document.addEventListener('DOMContentLoaded', () => {
+                if (scanning) tryFind();
+            }, { once: true });
+        }
+        timer = setInterval(() => {
+            if (tryFind()) return;
+            attempts += 1;
+            if (attempts >= maxAttempts) finish(null);
         }, 200);
     }
     injectStyle(`
@@ -2784,7 +2865,25 @@ UW.XMLHttpRequest.prototype.open = function(method, url) {
 const originalFetch = RAW_FETCH;
 if (typeof originalFetch === 'function') {
     UW.fetch = function(input, init) {
-        const requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
+        let requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
+        let freshUrl = null;
+        if (requestUrl && /\.m3u8(\?|$)/i.test(requestUrl)) {
+            try {
+                freshUrl = applyFreshM3u8Signature(requestUrl);
+            } catch (e) {
+                freshUrl = null;
+            }
+            if (freshUrl && freshUrl !== requestUrl) {
+                requestUrl = freshUrl;
+                if (typeof input === 'string') {
+                    input = freshUrl;
+                } else if (input && typeof input === 'object' && typeof UW.Request === 'function') {
+                    try { input = new UW.Request(freshUrl, input); } catch (e) {}
+                }
+                arguments[0] = input;
+                dlog('[dev] fetch m3u8 使用热替换签名');
+            }
+        }
         const request = originalFetch.apply(this, arguments);
         if (!isTargetTVApi(requestUrl)) {
             return request;
